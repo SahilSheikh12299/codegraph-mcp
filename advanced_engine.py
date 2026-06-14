@@ -214,8 +214,9 @@ class AdvancedRetrievalEngine:
             else:
                 markdown += f"Execution Signature: {meta.get('signature', '()')}\n"
                 
-            preview_body = self._create_surgical_preview(meta.get('chunk_text', ''))
-            markdown += f"Functional Content Outline:\n{preview_body}\n"
+            # preview_body = self._create_surgical_preview(meta.get('chunk_text', ''))
+            # markdown += f"Functional Content Outline:\n{preview_body}\n"
+            markdown += f"Implementation Logic: [Omitted to protect token window context. Use the 'fetch_node_source' tool with this node's exact ID to read its source code.]\n"
             markdown += f"```\n---\n"
 
         markdown += f"\n## SECTION 2: BARE-BONES RECURSIVE DEPENDENCY SKELETONS\n\n"
@@ -224,21 +225,24 @@ class AdvancedRetrievalEngine:
             
             file_groups = {}
             for item in blast_radius:
-                file_groups.setdefault(item["file_path"], []).append(item)
-                
+                display_group = item["file_path"] if item["file_path"] else "Project Core Module Setup"
+                file_groups.setdefault(display_group, []).append(item)
+            
             for file_path, items in file_groups.items():
-                markdown += f"  -> [AFFECTED FILE] {file_path}\n"
+                markdown += f"  -> [CONTEXT BLOCK] Location: `{file_path}`\n"
                 for item in items:
                     if item["type"] == "FUNCTION":
-                        markdown += f"     - Function Element: `def {item['name']}{item['signature']}`\n"
+                        markdown += f"     - **[FUNCTION]** `def {item['name']}{item['signature']}` | Node ID: `{item['node_id']}`\n"
                     elif item["type"] == "CLASS":
-                        markdown += f"     - Class Element: `class {item['name']}`\n"
+                        markdown += f"     - **[CLASS]** `class {item['name']}` | Node ID: `{item['node_id']}`\n"
                     elif item["type"] == "FILE":
-                        markdown += f"     - File Dependency Module: `{item['node_id']}`\n"
+                        markdown += f"     - **[FILE]** Node ID: `{item['node_id']}`\n"
+                    elif item["type"] == "MODULE":
+                        markdown += f"     - **[MODULE]** Node ID: `{item['node_id']}`\n"
                 markdown += f"  --------------------------------------------------\n"
         else:
             markdown += f"*No upstream recursive dependencies found for these targets. Modifications pose localized risk only.*\n"
-
+        print(f"THIS IS MARKDOWN ------------> {markdown}")
         return markdown
         
     def _create_surgical_preview(self, chunk_text: str) -> str:

@@ -131,7 +131,7 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
             # Update our tracking timestamp baseline
             G.graph['indexed_timestamps'][rel_path] = current_mtime
 
-    print(f"tHIS IS FIRST INITIALIZATION {first_run_initialization}")
+    
     if first_run_initialization:
         return first_run_initialization
 
