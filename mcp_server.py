@@ -59,14 +59,15 @@ def get_graph_paths(active_project_root: str | Path) -> Tuple[Path, Path]:
 
 def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalEmbeddingPipeline) -> bool:
     """
-    This already gets a graph with loaded code chunks, 
-    We need to add the embedding logic and implement the file tracking here
+    Surgically checks file timestamps and processes embedding vectors ONLY 
+    for cold-started files or elements showing active post-save deltas.
     """
-
     # Initialize our internal timestamp tracking map inside the graph's metadata if missing
     if 'indexed_timestamps' not in G.graph:
         G.graph['indexed_timestamps'] = {}
-
+    
+    # ──> FIXED: Wiped out the unconditional global embedder call from this line
+    
     # Gather all unique file paths currently tracked across your graph nodes
     tracked_files = {data.get("file_path") for _, data in G.nodes(data=True) if data.get("file_path")}
 
@@ -88,13 +89,43 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
         current_mtime = os.path.getmtime(full_path)
         last_indexed_time = G.graph['indexed_timestamps'].get(rel_path)
         
-        # Baseline initialization check
+        # =========================================================================
+        # ❄️ CHANNELS FIX A: TARGETED COLD-START EMBEDDING BACKFILL
+        # =========================================================================
         if last_indexed_time is None:
+            print(f"🧬 [COLD BOOT] Initializing tracking and batch vectors for: '{rel_path}'")
+            
+            nodes_to_encode = []
+            texts_to_encode = []
+            
+            # 1. Collect all cold chunks needing an embedding pass
+            for node_id, data in G.nodes(data=True):
+                if data.get("file_path") == rel_path:
+                    if "embedding" not in data or not data["embedding"]:
+                        chunk_text = data.get("chunk_text", "").strip()
+                        if chunk_text:
+                            nodes_to_encode.append(node_id)
+                            texts_to_encode.append(chunk_text)
+            
+            # 2. Compute embeddings in ONE single model forward pass
+            if texts_to_encode:
+                # The model internally parallelizes this entire array across a matrix batch
+                vectors = embedder.model.encode(texts_to_encode, convert_to_numpy=True).tolist()
+                
+                # 3. Zip and map the vectors back to the memory graph using index alignment
+                for node_id, vector in zip(nodes_to_encode, vectors):
+                    G.nodes[node_id]["embedding"] = vector
+                    
+                print(f"   ✅ Batched {len(texts_to_encode)} embeddings for '{rel_path}' successfully.")
+            
+            # Secure the timestamp boundary and move to next file smoothly
             G.graph['indexed_timestamps'][rel_path] = current_mtime
             first_run_initialization = True
             continue
             
-        # Check if file has been modified via autosave/manual edit
+        # =========================================================================
+        # 🔥 CHANNELS FIX B: INCREMENTAL DELTA UPGRADES (MANUAL EDITS / AUTOSAVE)
+        # =========================================================================
         if current_mtime > last_indexed_time:
             dirty_files_detected = True
             print(f"\n[⚠️ DIRTY FILE DETECTED] Change isolated in: '{rel_path}'")
@@ -131,12 +162,10 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
             # Update our tracking timestamp baseline
             G.graph['indexed_timestamps'][rel_path] = current_mtime
 
-    
     if first_run_initialization:
         return first_run_initialization
 
     return dirty_files_detected
-
 
 
 # =========================================================================
