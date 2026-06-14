@@ -1,0 +1,120 @@
+storage/
+models/
+
+
+
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# SQLite databases
+*.sqlite3
+*.db
+
+# Build artifacts
+*.tar.gz
+*.whl
+
+# Documentation
+docs/_build/
+
+# Ruff
+.ruff_cache/
+
+# Poetry
+poetry.lock
+
+# Pipenv
+Pipfile.lock
+
+# pyenv
+.python-version
+
+# PDM
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# Hatch
+.hatch/
+
+# VS Code test artifacts
+.vscode-test/
