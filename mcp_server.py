@@ -357,7 +357,31 @@ def fetch_node_source(node_id: str, active_project_root: str) -> str:
                 
         if G.has_node(node_id):
             node_data = G.nodes[node_id]
-            return f"### RAW SOURCE CONTENT FOR NODE: `{node_id}`\n\n```python\n{node_data.get('chunk_text', '# No content available.')}\n```"
+            node_type = node_data.get("type", "UNKNOWN")
+
+            # ──> THE CLASS ROUTER PATCH
+            if node_type == "CLASS":
+                # Start with the core class signature and docstring chunk text
+                source_out = f"### RAW SOURCE CONTENT FOR CLASS NODE: `{node_id}`\n\n"
+                source_out += f"```python\n{node_data.get('chunk_text', '# No header content available.')}\n```\n\n"
+                source_out += "### INTERFACE MAP: AVAILABLE MEMBER METHODS WITHIN THIS CLASS\n"
+                source_out += "To read the operational logic of any method below, use 'fetch_node_source' with its absolute Node ID:\n"
+                
+                found_methods = False
+                # Scan the graph for functions belonging to this class in the same file
+                for sub_id, sub_data in G.nodes(data=True):
+                    if sub_data.get("belongs_to_class") == node_data.get("name") and sub_data.get("file_path") == node_data.get("file_path"):
+                        source_out += f"  - [METHOD] `def {sub_data.get('name')}{sub_data.get('signature', '()')}` | Node ID: `{sub_id}`\n"
+                        found_methods = True
+                        
+                if not found_methods:
+                    source_out += "  (No child methods indexed for this class block.)\n"
+                return source_out
+
+            # ──> STANDARD FUNCTION/FILE FALLBACK (Keeps your original behavior intact)
+            else:
+                return f"### RAW SOURCE CONTENT FOR NODE: `{node_id}`\n\n```python\n{node_data.get('chunk_text', '# No content available.')}\n```"
+
         return f"### [Graph-RAG System Message]\nNode ID '{node_id}' not found."
     finally:
         model_manager.release()

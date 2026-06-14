@@ -203,20 +203,39 @@ class AdvancedRetrievalEngine:
 
         for idx, hit in enumerate(final_seeds, 1):
             meta = hit["metadata"]
-            markdown += f"### [Hit {idx}] `{hit['node_id']}`\n"
+            node_id = hit["node_id"]
+            
+            markdown += f"### [Hit {idx}] `{node_id}`\n"
             markdown += f"  - Match Mechanics: {hit['mechanism']}\n"
             markdown += f"  - System Alignment Confidence: {hit['confidence']:.4f}\n\n"
             markdown += f"```text\n"
             markdown += f"Entity Type: {meta.get('type')}\n"
             
+            # If it's a class, pull its internal methods right into the blueprint
             if meta.get("type") == "CLASS":
                 markdown += f"Class Ancestors: {meta.get('bases', [])}\n"
+                if meta.get("docstring"):
+                    markdown += f"Class Summary: {meta.get('docstring').strip().split('\n')[0]}\n"
+                
+                markdown += "Available Member Methods (Use 'fetch_node_source' on these Node IDs):\n"
+                found_methods = False
+                # Self.graph holds the network instance inside your advanced retrieval engine
+                for sub_id, sub_data in self.G.nodes(data=True):
+                    if sub_data.get("belongs_to_class") == meta.get("name") and sub_data.get("file_path") == meta.get("file_path"):
+                        markdown += f"  -> def {sub_data.get('name')}{sub_data.get('signature', '()')} | Node ID: `{sub_id}`\n"
+                        found_methods = True
+                if not found_methods:
+                    markdown += "  -> (No child methods indexed)\n"
+            
+            # If it's a function, expose its docstring so the LLM isn't flying blind
             else:
                 markdown += f"Execution Signature: {meta.get('signature', '()')}\n"
+                if meta.get("docstring"):
+                    # Give it a clean, non-bloating docstring preview
+                    clean_doc = meta.get("docstring").strip()
+                    markdown += f"Function Behavior: {clean_doc if len(clean_doc) < 200 else clean_doc[:200] + '...'}\n"
                 
-            # preview_body = self._create_surgical_preview(meta.get('chunk_text', ''))
-            # markdown += f"Functional Content Outline:\n{preview_body}\n"
-            markdown += f"Implementation Logic: [Omitted to protect token window context. Use the 'fetch_node_source' tool with this node's exact ID to read its source code.]\n"
+            markdown += f"\nImplementation Logic: [Omitted to protect token window. Execute 'fetch_node_source' with this item's specific Node ID to read or modify its source code.]\n"
             markdown += f"```\n---\n"
 
         markdown += f"\n## SECTION 2: BARE-BONES RECURSIVE DEPENDENCY SKELETONS\n\n"
