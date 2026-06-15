@@ -111,7 +111,8 @@ class GraphSerializer:
                 for node_id, data in extract_file_entities(repo_relative_path, repo_root).items():
                     if G.has_node(node_id):
                         G.nodes[node_id]["chunk_text"] = data["chunk_text"]
-            G.graph["chunk_schema"] = 2
+                        G.nodes[node_id]["embedding_text"] = data["embedding_text"]
+            G.graph["chunk_schema"] = 3
             G.graph["calls_schema"] = 1
 
             # Output detailed diagnostics to verify your metrics

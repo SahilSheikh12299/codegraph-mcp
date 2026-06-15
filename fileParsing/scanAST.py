@@ -129,6 +129,29 @@ class ASTParser:
             return "Unknown"
 
 
+def build_embedding_text(
+    node_type: str,
+    name: str,
+    *,
+    signature: str = "()",
+    docstring: str = "",
+    bases: list | None = None,
+    belongs_to_class: str | None = None,
+) -> str:
+    """Compact text for vector search — not returned on fetch."""
+    lines = [f"Type: {node_type}", f"Name: {name}"]
+    if belongs_to_class:
+        lines.append(f"Class: {belongs_to_class}")
+    if node_type == "CLASS" and bases:
+        lines.append(f"Inherits: {', '.join(bases)}")
+    if node_type == "FUNCTION":
+        lines.append(f"Signature: def {name}{signature}")
+    if docstring:
+        first_line = docstring.strip().split("\n")[0]
+        lines.append(f"Summary: {first_line[:300]}")
+    return "\n".join(lines)
+
+
 def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
     """Parses a python file using its absolute path, but labels the nodes
 
@@ -155,12 +178,18 @@ def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
             
         def visit_ClassDef(self, node):
             node_id = f"{rel_path}::{node.name}"
+            docstring = ast.get_docstring(node) or ""
+            bases = [ast.unparse(b) for b in node.bases]
             entities[node_id] = {
                 "type": "CLASS",
                 "name": node.name,
                 "file_path": rel_path,
                 "chunk_text": ast.get_source_segment(source, node),
-                "bases": [ast.unparse(b) for b in node.bases]
+                "docstring": docstring,
+                "bases": bases,
+                "embedding_text": build_embedding_text(
+                    "CLASS", node.name, docstring=docstring, bases=bases
+                ),
             }
             old_class = self.current_class
             self.current_class = node.name
@@ -174,12 +203,23 @@ def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
                 node_id = f"{rel_path}::{node.name}"
                 
             args = [arg.arg for arg in node.args.args]
+            signature = f"({', '.join(args)})"
+            docstring = ast.get_docstring(node) or ""
             entities[node_id] = {
                 "type": "FUNCTION",
                 "name": node.name,
                 "file_path": rel_path,
                 "chunk_text": ast.get_source_segment(source, node),
-                "signature": f"({', '.join(args)})"
+                "signature": signature,
+                "docstring": docstring,
+                "belongs_to_class": self.current_class,
+                "embedding_text": build_embedding_text(
+                    "FUNCTION",
+                    node.name,
+                    signature=signature,
+                    docstring=docstring,
+                    belongs_to_class=self.current_class,
+                ),
             }
             self.generic_visit(node)
 

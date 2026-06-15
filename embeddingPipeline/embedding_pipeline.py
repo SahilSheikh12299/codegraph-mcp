@@ -32,10 +32,10 @@ class LocalEmbeddingPipeline:
         texts_to_encode = []
 
         for node_id, data in graph.nodes(data=True):
-            chunk_text = data.get("chunk_text", "").strip()
-            if chunk_text:
+            text = (data.get("embedding_text") or data.get("chunk_text") or "").strip()
+            if text:
                 nodes_to_encode.append(node_id)
-                texts_to_encode.append(chunk_text)
+                texts_to_encode.append(text)
 
         if not texts_to_encode:
             print("[Warning] No text chunks discovered in the graph.")

@@ -90,12 +90,18 @@ def get_graph_paths(active_project_root: str | Path) -> Tuple[Path, Path]:
     )
 
 
+def _text_for_embedding(data: dict) -> str:
+    """Prefer compact embedding_text; fall back to chunk_text for FILE/MODULE nodes."""
+    return (data.get("embedding_text") or data.get("chunk_text") or "").strip()
+
+
 def backfill_source_chunks(G: nx.DiGraph, repo_root: Path, rel_paths: set[str]) -> None:
-    """Overlay real AST source segments onto graph nodes for embedding."""
+    """Overlay real AST source segments and embedding_text onto graph nodes."""
     for rel_path in rel_paths:
         for node_id, data in extract_file_entities(rel_path, repo_root).items():
             if G.has_node(node_id):
                 G.nodes[node_id]["chunk_text"] = data["chunk_text"]
+                G.nodes[node_id]["embedding_text"] = data["embedding_text"]
             else:
                 G.add_node(node_id, **data)
 
@@ -106,10 +112,10 @@ def _embed_file_nodes(G: nx.DiGraph, rel_path: str, embedder: LocalEmbeddingPipe
     texts_to_encode = []
     for node_id, data in G.nodes(data=True):
         if data.get("file_path") == rel_path:
-            chunk_text = data.get("chunk_text", "").strip()
-            if chunk_text:
+            text = _text_for_embedding(data)
+            if text:
                 nodes_to_encode.append(node_id)
-                texts_to_encode.append(chunk_text)
+                texts_to_encode.append(text)
     if texts_to_encode:
         vectors = embedder.model.encode(texts_to_encode, convert_to_numpy=True).tolist()
         for node_id, vector in zip(nodes_to_encode, vectors):
@@ -159,12 +165,12 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
 
     schema_dirty = False
 
-    if G.graph.get("chunk_schema") != 2:
+    if G.graph.get("chunk_schema") != 3:
         backfill_source_chunks(G, repo_root, tracked_files)
         for rel_path in tracked_files:
             if (repo_root / rel_path).exists():
                 _embed_file_nodes(G, rel_path, embedder)
-        G.graph["chunk_schema"] = 2
+        G.graph["chunk_schema"] = 3
         schema_dirty = True
 
     if G.graph.get("calls_schema") != 1:
@@ -257,12 +263,14 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
                     # If chunk text differs, it's an inline structural edit
                     if fresh_data["chunk_text"] != existing_file_nodes[node_id].get("chunk_text"):
                         print(f"  -> [MODIFIED] Element updated: `{node_id}`. Regenerating vector...")
-                        fresh_data["embedding"] = embedder.model.encode(fresh_data["chunk_text"], convert_to_numpy=True).tolist()
+                        emb_text = _text_for_embedding(fresh_data)
+                        fresh_data["embedding"] = embedder.model.encode(emb_text, convert_to_numpy=True).tolist()
                         G.add_node(node_id, **fresh_data)
                 else:
                     # The node ID is brand new to the system
                     print(f"  -> [ADDED] New element detected: `{node_id}`. Generating vector...")
-                    fresh_data["embedding"] = embedder.model.encode(fresh_data["chunk_text"], convert_to_numpy=True).tolist()
+                    emb_text = _text_for_embedding(fresh_data)
+                    fresh_data["embedding"] = embedder.model.encode(emb_text, convert_to_numpy=True).tolist()
                     G.add_node(node_id, **fresh_data)
                     
             # --- SUB-STEP B: EVALUATE DELETED ELEMENTS ---
