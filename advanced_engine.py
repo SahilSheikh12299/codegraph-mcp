@@ -8,6 +8,32 @@ import networkx as nx
 from typing import List, Dict, Any, Tuple
 import ast
 
+
+def get_call_neighbors(G: nx.DiGraph, node_id: str, limit: int = 5) -> Tuple[List[str], List[str]]:
+    """Return 1-hop CALLS predecessors (callers) and successors (callees)."""
+    if not G.has_node(node_id):
+        return [], []
+    callers = [
+        p for p in G.predecessors(node_id)
+        if G.edges[p, node_id].get("relationship") == "CALLS"
+    ]
+    callees = [
+        s for s in G.successors(node_id)
+        if G.edges[node_id, s].get("relationship") == "CALLS"
+    ]
+    return sorted(callers)[:limit], sorted(callees)[:limit]
+
+
+def format_call_neighbors(G: nx.DiGraph, node_id: str, limit: int = 5) -> str:
+    callers, callees = get_call_neighbors(G, node_id, limit)
+    lines = []
+    if callers:
+        lines.append(f"- called_by: {', '.join(f'`{c}`' for c in callers)}")
+    if callees:
+        lines.append(f"- calls: {', '.join(f'`{c}`' for c in callees)}")
+    return "\n".join(lines)
+
+
 class AdvancedRetrievalEngine:
     """The analytical core of the Graph-RAG system. Handles dual-pronged retrieval,
     mathematical cliff-detection re-ranking, and recursive upstream blast-radius mappings.
@@ -190,78 +216,50 @@ class AdvancedRetrievalEngine:
                 max_gap = gap
                 dynamic_cutoff = i + 1
 
-        final_seeds = unified_candidates[:dynamic_cutoff]
-        target_ids = [hit["node_id"] for hit in final_seeds]
-        
-        blast_radius = self.compute_upstream_blast_radius(target_ids)
+        top = unified_candidates[0]
+        if top["confidence"] >= 0.9 and top["mechanism"] == "EXACT_SYMBOL_MATCH":
+            final_seeds = [top]
+        else:
+            final_seeds = unified_candidates[:min(dynamic_cutoff, 4)]
 
-        markdown = f"========================================================\n"
-        markdown += f"  INTELLIGENT KNOWLEDGE BLUEPRINT FOR WORKSPACE ASSISTANT\n"
-        markdown += f"========================================================\n\n"
-        markdown += f"**Processed Operational Goals:** {', '.join(search_queries)}\n\n"
-        markdown += f"## SECTION 1: PRIMARY TARGET ENTITIES\n\n"
+        markdown = "## Codebase Search Results\n\n"
+        markdown += f"Queries: {', '.join(search_queries)}\n\n"
 
         for idx, hit in enumerate(final_seeds, 1):
             meta = hit["metadata"]
             node_id = hit["node_id"]
-            
-            markdown += f"### [Hit {idx}] `{node_id}`\n"
-            markdown += f"  - Match Mechanics: {hit['mechanism']}\n"
-            markdown += f"  - System Alignment Confidence: {hit['confidence']:.4f}\n\n"
-            markdown += f"```text\n"
-            markdown += f"Entity Type: {meta.get('type')}\n"
-            
-            # If it's a class, pull its internal methods right into the blueprint
+
+            markdown += f"### Hit {idx}: `{node_id}`\n"
+            markdown += f"- confidence: {hit['confidence']:.4f} | match: {hit['mechanism']}\n"
+            markdown += f"- type: {meta.get('type')}\n"
+
             if meta.get("type") == "CLASS":
-                markdown += f"Class Ancestors: {meta.get('bases', [])}\n"
                 if meta.get("docstring"):
-                    markdown += f"Class Summary: {meta.get('docstring').strip().split('\n')[0]}\n"
-                
-                markdown += "Available Member Methods (Use 'fetch_node_source' on these Node IDs):\n"
-                found_methods = False
-                # Self.graph holds the network instance inside your advanced retrieval engine
+                    summary = meta.get("docstring").strip().split("\n")[0]
+                    markdown += f"- summary: {summary[:120]}\n"
+                markdown += "- methods (use fetch_node_source on node_id):\n"
+                method_count = 0
                 for sub_id, sub_data in self.G.nodes(data=True):
                     if sub_data.get("belongs_to_class") == meta.get("name") and sub_data.get("file_path") == meta.get("file_path"):
-                        markdown += f"  -> def {sub_data.get('name')}{sub_data.get('signature', '()')} | Node ID: `{sub_id}`\n"
-                        found_methods = True
-                if not found_methods:
-                    markdown += "  -> (No child methods indexed)\n"
-            
-            # If it's a function, expose its docstring so the LLM isn't flying blind
+                        markdown += f"  - `{sub_id}` def {sub_data.get('name')}{sub_data.get('signature', '()')}\n"
+                        method_count += 1
+                        if method_count >= 8:
+                            markdown += "  - ... (more methods available via fetch_node_source)\n"
+                            break
             else:
-                markdown += f"Execution Signature: {meta.get('signature', '()')}\n"
+                markdown += f"- signature: {meta.get('signature', '()')}\n"
                 if meta.get("docstring"):
-                    # Give it a clean, non-bloating docstring preview
-                    clean_doc = meta.get("docstring").strip()
-                    markdown += f"Function Behavior: {clean_doc if len(clean_doc) < 200 else clean_doc[:200] + '...'}\n"
-                
-            markdown += f"\nImplementation Logic: [Omitted to protect token window. Execute 'fetch_node_source' with this item's specific Node ID to read or modify its source code.]\n"
-            markdown += f"```\n---\n"
+                    summary = meta.get("docstring").strip()
+                    markdown += f"- summary: {summary[:120]}{'...' if len(summary) > 120 else ''}\n"
 
-        markdown += f"\n## SECTION 2: BARE-BONES RECURSIVE DEPENDENCY SKELETONS\n\n"
-        if blast_radius:
-            markdown += f"**CRITICAL WARNING:** Altering the entities in Section 1 causes a domino risk across **{len(blast_radius)}** upstream code structures. Ensure API signature stability:\n"
-            
-            file_groups = {}
-            for item in blast_radius:
-                display_group = item["file_path"] if item["file_path"] else "Project Core Module Setup"
-                file_groups.setdefault(display_group, []).append(item)
-            
-            for file_path, items in file_groups.items():
-                markdown += f"  -> [CONTEXT BLOCK] Location: `{file_path}`\n"
-                for item in items:
-                    if item["type"] == "FUNCTION":
-                        markdown += f"     - **[FUNCTION]** `def {item['name']}{item['signature']}` | Node ID: `{item['node_id']}`\n"
-                    elif item["type"] == "CLASS":
-                        markdown += f"     - **[CLASS]** `class {item['name']}` | Node ID: `{item['node_id']}`\n"
-                    elif item["type"] == "FILE":
-                        markdown += f"     - **[FILE]** Node ID: `{item['node_id']}`\n"
-                    elif item["type"] == "MODULE":
-                        markdown += f"     - **[MODULE]** Node ID: `{item['node_id']}`\n"
-                markdown += f"  --------------------------------------------------\n"
-        else:
-            markdown += f"*No upstream recursive dependencies found for these targets. Modifications pose localized risk only.*\n"
-        print(f"THIS IS MARKDOWN ------------> {markdown}")
+            neighbors = format_call_neighbors(self.G, node_id)
+            if neighbors:
+                markdown += neighbors + "\n"
+            markdown += f"- action: call fetch_node_source with node_id `{node_id}` to read implementation\n"
+            if neighbors and "called_by:" in neighbors:
+                markdown += "- if this looks like a helper, fetch a `called_by` node or use trace_callers\n"
+            markdown += "\n"
+
         return markdown
         
     def _create_surgical_preview(self, chunk_text: str) -> str:

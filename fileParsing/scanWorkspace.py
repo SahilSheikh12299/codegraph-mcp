@@ -15,7 +15,7 @@ class WorkspaceScanner:
         # Industry standard directories to skip to prevent performance lag
         self.default_ignores: Set[str] = {
             ".git",
-            ".cursor"
+            ".cursor",
             ".venv",
             "venv",
             "env",

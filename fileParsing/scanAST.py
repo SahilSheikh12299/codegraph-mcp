@@ -100,7 +100,8 @@ class ASTParser:
                     "name": sub_node.name,
                     "line_span": (sub_node.lineno, sub_node.end_lineno),  # <--- UPGRADED
                     "arguments": [arg.arg for arg in sub_node.args.args],
-                    "is_async": isinstance(sub_node, ast.AsyncFunctionDef)
+                    "is_async": isinstance(sub_node, ast.AsyncFunctionDef),
+                    "calls": self._extract_calls_from_body(sub_node.body),
                 })
         return methods
     # Add this helper method inside your ASTParser class

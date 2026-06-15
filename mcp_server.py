@@ -11,7 +11,7 @@ from filelock import FileLock
 import re
 import os
 from typing import Dict, Any, Tuple, List
-from fileParsing import extract_file_entities
+from fileParsing import extract_file_entities, WorkspaceScanner, ASTParser, ImportTracker
 
 # Completely muzzle third-party library progress bars before they can print
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -20,7 +20,13 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Import your validated local analytical engine modules
 from graph_io import GraphSerializer
 from embeddingPipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
-from advanced_engine import AdvancedRetrievalEngine
+from advanced_engine import AdvancedRetrievalEngine, format_call_neighbors, get_call_neighbors
+from buildGraph import (
+    wire_calls_for_file,
+    build_func_registry_from_graph,
+    strip_calls_edges,
+    strip_calls_edges_for_file,
+)
 
 # Configure silent logging to avoid corrupting standard output
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
@@ -34,6 +40,33 @@ mcp = FastMCP("Cursor-Graph-RAG-Engine")
 
 model_manager = EmbeddingModelLifecycleManager()
 
+
+
+def _is_stub_source(source: str) -> bool:
+    s = source.strip()
+    return s.endswith("...") or s.endswith(": ...")
+
+
+def _find_impl_alternate(G: nx.DiGraph, node_id: str, node_data: dict) -> str | None:
+    """If node is a Protocol stub, find a fuller same-name implementation in the same file."""
+    name, file_path = node_data.get("name"), node_data.get("file_path")
+    if not name or not file_path:
+        return None
+    best_id, best_len = None, 0
+    for nid, d in G.nodes(data=True):
+        if d.get("file_path") != file_path or d.get("name") != name or _is_stub_source(d.get("chunk_text", "")):
+            continue
+        chunk_len = len(d.get("chunk_text", ""))
+        if chunk_len > best_len:
+            best_len, best_id = chunk_len, nid
+    return best_id if best_id and best_id != node_id else None
+
+
+def _graph_neighbors_footer(G: nx.DiGraph, node_id: str) -> str:
+    neighbors = format_call_neighbors(G, node_id)
+    if not neighbors:
+        return ""
+    return f"\n\n### Graph neighbors\n{neighbors}"
 
 
 def get_graph_paths(active_project_root: str | Path) -> Tuple[Path, Path]:
@@ -57,24 +90,124 @@ def get_graph_paths(active_project_root: str | Path) -> Tuple[Path, Path]:
     )
 
 
+def backfill_source_chunks(G: nx.DiGraph, repo_root: Path, rel_paths: set[str]) -> None:
+    """Overlay real AST source segments onto graph nodes for embedding."""
+    for rel_path in rel_paths:
+        for node_id, data in extract_file_entities(rel_path, repo_root).items():
+            if G.has_node(node_id):
+                G.nodes[node_id]["chunk_text"] = data["chunk_text"]
+            else:
+                G.add_node(node_id, **data)
+
+
+def _embed_file_nodes(G: nx.DiGraph, rel_path: str, embedder: LocalEmbeddingPipeline) -> int:
+    """Batch-encode all nodes belonging to a single file."""
+    nodes_to_encode = []
+    texts_to_encode = []
+    for node_id, data in G.nodes(data=True):
+        if data.get("file_path") == rel_path:
+            chunk_text = data.get("chunk_text", "").strip()
+            if chunk_text:
+                nodes_to_encode.append(node_id)
+                texts_to_encode.append(chunk_text)
+    if texts_to_encode:
+        vectors = embedder.model.encode(texts_to_encode, convert_to_numpy=True).tolist()
+        for node_id, vector in zip(nodes_to_encode, vectors):
+            G.nodes[node_id]["embedding"] = vector
+    return len(texts_to_encode)
+
+
+def _parse_file_call_assets(repo_root: Path, rel_path: str, tracker: ImportTracker) -> dict:
+    full_path = repo_root / rel_path
+    ast_data = ASTParser(file_path=full_path).parse()
+    import_data = tracker.get_dependencies(full_path)
+    return {
+        "classes": ast_data.get("classes", []),
+        "functions": ast_data.get("functions", []),
+        "top_level_calls": ast_data.get("top_level_calls", []),
+        "internal_imports": import_data.get("internal_paths", []),
+    }
+
+
+def _rewire_all_calls(G: nx.DiGraph, repo_root: Path) -> None:
+    strip_calls_edges(G)
+    registry = build_func_registry_from_graph(G)
+    tracked = {d.get("file_path") for _, d in G.nodes(data=True) if d.get("file_path")}
+    python_files = WorkspaceScanner(repo_root).scan()
+    tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
+    for rel_path in sorted(tracked):
+        if (repo_root / rel_path).exists():
+            wire_calls_for_file(G, rel_path, _parse_file_call_assets(repo_root, rel_path, tracker), registry)
+
+
+def _rewire_file_calls(G: nx.DiGraph, repo_root: Path, rel_path: str, tracker: ImportTracker) -> None:
+    strip_calls_edges_for_file(G, rel_path)
+    registry = build_func_registry_from_graph(G)
+    wire_calls_for_file(G, rel_path, _parse_file_call_assets(repo_root, rel_path, tracker), registry)
+
+
 def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalEmbeddingPipeline) -> bool:
     """
     Surgically checks file timestamps and processes embedding vectors ONLY 
     for cold-started files or elements showing active post-save deltas.
     """
-    # Initialize our internal timestamp tracking map inside the graph's metadata if missing
     if 'indexed_timestamps' not in G.graph:
         G.graph['indexed_timestamps'] = {}
-    
-    # ──> FIXED: Wiped out the unconditional global embedder call from this line
-    
-    # Gather all unique file paths currently tracked across your graph nodes
+
     tracked_files = {data.get("file_path") for _, data in G.nodes(data=True) if data.get("file_path")}
+    tracked_files.discard(None)
+
+    schema_dirty = False
+
+    if G.graph.get("chunk_schema") != 2:
+        backfill_source_chunks(G, repo_root, tracked_files)
+        for rel_path in tracked_files:
+            if (repo_root / rel_path).exists():
+                _embed_file_nodes(G, rel_path, embedder)
+        G.graph["chunk_schema"] = 2
+        schema_dirty = True
+
+    if G.graph.get("calls_schema") != 1:
+        _rewire_all_calls(G, repo_root)
+        G.graph["calls_schema"] = 1
+        schema_dirty = True
+
+    if schema_dirty:
+        return True
 
     dirty_files_detected = False
     first_run_initialization = False
+    import_tracker: ImportTracker | None = None
 
-    print(f"[Sync Engine] Scanning metadata for {len(tracked_files)} files...")
+    for rel_path in list(tracked_files):
+        if not (repo_root / rel_path).exists():
+            for nid, d in list(G.nodes(data=True)):
+                if d.get("file_path") == rel_path:
+                    G.remove_node(nid)
+            G.graph["indexed_timestamps"].pop(rel_path, None)
+            tracked_files.discard(rel_path)
+            dirty_files_detected = True
+
+    current_files = {str(p.relative_to(repo_root)) for p in WorkspaceScanner(repo_root).scan()}
+    for rel_path in current_files - tracked_files:
+        full_path = repo_root / rel_path
+        file_id = rel_path
+        if not G.has_node(file_id):
+            with open(full_path, "r", encoding="utf-8") as f:
+                line_count = sum(1 for _ in f)
+            G.add_node(file_id, type="FILE", path=rel_path, line_count=line_count, docstring="")
+
+        for node_id, data in extract_file_entities(rel_path, repo_root).items():
+            G.add_node(node_id, **data)
+            if not G.has_edge(file_id, node_id):
+                G.add_edge(file_id, node_id, relationship="CONTAINS")
+
+        _embed_file_nodes(G, rel_path, embedder)
+        G.graph["indexed_timestamps"][rel_path] = os.path.getmtime(full_path)
+        dirty_files_detected = True
+        tracked_files.add(rel_path)
+
+    print(f"[Sync Engine] Scanning metadata for {len(tracked_files)} files...", file=sys.stderr)
 
     for rel_path in tracked_files:
         if not rel_path:
@@ -93,30 +226,9 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
         # ❄️ CHANNELS FIX A: TARGETED COLD-START EMBEDDING BACKFILL
         # =========================================================================
         if last_indexed_time is None:
-            print(f"🧬 [COLD BOOT] Initializing tracking and batch vectors for: '{rel_path}'")
-            
-            nodes_to_encode = []
-            texts_to_encode = []
-            
-            # 1. Collect all cold chunks needing an embedding pass
-            for node_id, data in G.nodes(data=True):
-                if data.get("file_path") == rel_path:
-                    if "embedding" not in data or not data["embedding"]:
-                        chunk_text = data.get("chunk_text", "").strip()
-                        if chunk_text:
-                            nodes_to_encode.append(node_id)
-                            texts_to_encode.append(chunk_text)
-            
-            # 2. Compute embeddings in ONE single model forward pass
-            if texts_to_encode:
-                # The model internally parallelizes this entire array across a matrix batch
-                vectors = embedder.model.encode(texts_to_encode, convert_to_numpy=True).tolist()
-                
-                # 3. Zip and map the vectors back to the memory graph using index alignment
-                for node_id, vector in zip(nodes_to_encode, vectors):
-                    G.nodes[node_id]["embedding"] = vector
-                    
-                print(f"   ✅ Batched {len(texts_to_encode)} embeddings for '{rel_path}' successfully.")
+            count = _embed_file_nodes(G, rel_path, embedder)
+            if count:
+                print(f"[COLD BOOT] Batched {count} embeddings for '{rel_path}'.", file=sys.stderr)
             
             # Secure the timestamp boundary and move to next file smoothly
             G.graph['indexed_timestamps'][rel_path] = current_mtime
@@ -162,6 +274,11 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
             # Update our tracking timestamp baseline
             G.graph['indexed_timestamps'][rel_path] = current_mtime
 
+            if import_tracker is None:
+                python_files = WorkspaceScanner(repo_root).scan()
+                import_tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
+            _rewire_file_calls(G, repo_root, rel_path, import_tracker)
+
     if first_run_initialization:
         return first_run_initialization
 
@@ -173,47 +290,13 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
 # =========================================================================
 @mcp.tool()
 def search_codebase_intent(search_queries: list[str], active_project_root: str, targeted_symbols: list[str] = None) -> str:
-    """CRITICAL CODEBASE ARCHITECTURE DISCOVERY ENGINE.
-    
-    Deconstructs complex multi-layered human prompts into highly targeted, 
-    orthogonal, dense vector search operations to map intent to source code layers.
-
-    WHEN TO USE THIS TOOL:
-    - Invoke this at the start of EVERY repository analysis, feature implementation, or bug audit.
-    - Use this to map general human feature descriptions straight to concrete code layout positions.
-
-    QUERY GENERATION ALGORITHM FOR THE LLM:
-    1. **Deconstruct Compound Intents**: Analyze the user's prompt for multi-part objectives or distinct 
-       subsystems (e.g., "Where is data cached AND how are validation errors raised?").
-    2. **Isolate Architectural Layers**: Break compound questions into an array of completely separate, 
-       non-overlapping search queries. Generate exactly ONE dedicated query string per technical concept.
-    3. **Populate with Dense Semantic Tokens**: For each query string in the list, construct a precise, 
-       keyword-dense vector target using the mandatory structural formula below.
-
-    THE SEARCH QUERY STRUCTURAL FORMULA:
-    Every string inside the `search_queries` list must adhere to this strict layout:
-    `[Target Component/Class/Module Noun] [Functional Action/Process Verb] [State/Exception/Error Condition]`
-
-    - EXECUTABLE COMPLIANCE EXAMPLES:
-      * Human: "Find where we check user tokens and return expired session exceptions."
-        -> search_queries: ["Auth Token Validator verify authenticate", "Session Expiration timeout exception error handler"]
-      * Human: "Where are database writes handled and how do we retry failed connections?"
-        -> search_queries: ["Database Storage transaction write commit pool", "Connection Retry backoff circuit breaker failure"]
-
-    - PROHIBITED ANTI-PATTERNS (DO NOT DO):
-      - Never include conversational filler, greeting words, polite punctuation, or question pronouns 
-        (e.g., strip 'please find', 'how do we', 'where is', 'show me').
-      - Never smash completely independent architectural layers into a single query string.
+    """Find code by intent. Returns node_id, called_by, and calls — not source.
+    Workflow: one search → fetch top hit → follow neighbors or trace_callers. No second search.
 
     Args:
-        search_queries (list[str]): A list of highly focused, atomized technical keyword vectors.
-                                    Generate a unique string item for each structural subsystem or 
-                                    isolated engineering concept present in the user's prompt.
-        active_project_root (str): The absolute file path to the user's current active project repository.
-        targeted_symbols (list[str], optional): An explicit array of case-sensitive code identifiers 
-                                                (Class names, method names, standalone files) isolated 
-                                                directly from the chat history. Leave as None if no symbols 
-                                                are explicitly named.
+        search_queries: One keyword-dense string per topic. Multiple only for separate subsystems.
+        active_project_root: Absolute path to the repo root.
+        targeted_symbols: Optional identifiers from the user's message, e.g. ["Session"].
     """
     # Workspace root is the project dir where cursor has been opened
     workspace_root = Path(active_project_root).resolve()
@@ -236,43 +319,11 @@ def search_codebase_intent(search_queries: list[str], active_project_root: str, 
 
 @mcp.tool()
 def calculate_blast_radius(target_symbol: str, active_project_root: str) -> str:
-    """CRITICAL UPSTREAM STATIC-ANALYSIS TRAVERSAL ENGINE.
-    
-    DO NOT ATTEMPT TO MODIFY, DELETE, OR ALTER THE SIGNATURE OF ANY CODE ELEMENT BLINDLY.
-    You must invoke this tool before proposing a code modification or refactor to audit the 
-    cascading regression risks across the wider codebase.
-
-    WHAT THIS TOOL PROVIDES TO YOU:
-    1. A complete recursive 'Domino Effect' impact map tracing all upstream dependent entities.
-    2. The exact relative file paths where the affected elements reside.
-    3. The concrete structural typings (Class vs Function) and execution footprints 
-       of every single entity that will break if your target component is changed.
-
-    WHEN TO USE THIS TOOL:
-    - You MUST call this the moment you identify a target component to change, right BEFORE writing code.
-    - Use this when an edit might alter an API contract, method argument list, or return type behavior.
-    - Use this to guarantee zero-regression stability for multi-file code updates.
+    """List upstream dependents before editing code. Not for discovery-only questions.
 
     Args:
-        target_symbol (str): The single, exact, case-sensitive technical name of the code component 
-                             being audited for downstream failures. 
-                             
-                             CRITICAL INSTRUCTIONS:
-                             1. This must be a raw code identifier ONLY. 
-                             2. Do NOT pass descriptive human sentences, file paths, or multi-word search phrases.
-                             3. If the target is a class method, provide either the bare method name or the 
-                                dot-notation format if known from history.
-                             
-                             - EXAMPLES:
-                               * CORRECT: "resolve_redirects"
-                               * CORRECT: "HTTPAdapter"
-                               * CORRECT: "Session.request"
-                               * INCORRECT: "the redirect function in sessions"
-                               * INCORRECT: "modify the timeout configuration parameter"
-                               * INCORRECT: "src/requests/sessions.py"
-        
-        active_project_root (str): The absolute path to the user's current active project repository.
-
+        target_symbol: Raw identifier only, e.g. "resolve_redirects" or "Session.request".
+        active_project_root: Absolute path to the repo root.
     """
     workspace_root = Path(active_project_root).resolve()
     
@@ -306,43 +357,12 @@ def calculate_blast_radius(target_symbol: str, active_project_root: str) -> str:
 
 @mcp.tool()
 def fetch_node_source(node_id: str, active_project_root: str) -> str:
-    """CRITICAL GRANULAR SOURCE EXTRACTION ENGINE.
-    
-    DO NOT GUESS NODE IDENTIFIERS, ASSUME LINE CONTENT BOUNDARIES, OR PROPOSE REFLEXIVE 
-    CODE MODIFICATIONS BLINDLY. You must call this tool to extract the exact, raw, un-truncated 
-    internal Python implementation of a code element before reviewing it or modifying it.
-
-    WHAT THIS TOOL PROVIDES TO YOU:
-    1. The absolute, un-truncated, pristine functional source code block for the target element.
-    2. Deep implementation visibility (internal variable definitions, inner logic expressions, 
-       and sub-method execution patterns) that were truncated or skipped in general search previews.
-
-    WHEN TO USE THIS TOOL:
-    - You MUST use this tool after identifying critical component boundaries via `search_codebase_intent`.
-    - Use this right before writing a code change or comprehensive refactoring block to ensure 
-      you see 100% of the internal logic details.
-    - This is your final target lookup tool before delivering code modifications back to the user chat.
+    """Source for one node_id plus Graph neighbors (called_by, calls).
+    Follow neighbors to walk the call graph. Do not Read/Grep after a successful fetch.
 
     Args:
-        node_id (str): The exact, unique, case-sensitive internal graph identifier string.
-                       
-                       CRITICAL INSTRUCTIONS:
-                       1. This is a strict systemic key. Do NOT pass bare human keywords, general expressions, 
-                          or simple file names.
-                       2. You must copy-paste this string EXACTLY as it appears inside the node_id fields 
-                          returned from previous tool runs (`search_codebase_intent` or `calculate_blast_radius`).
-                       3. The format must always follow our absolute ledger schema: 
-                          'relative_file_path::ClassName.method_name' or 'relative_file_path::function_name'.
-                       
-                       - EXAMPLES:
-                         * CORRECT: "src/requests/sessions.py::SessionRedirectMixin.resolve_redirects"
-                         * CORRECT: "src/requests/utils.py::to_key_val_list"
-                         * INCORRECT: "resolve_redirects"
-                         * INCORRECT: "def resolve_redirects(self, resp)"
-                         * INCORRECT: "src/requests/sessions.py"
-
-        active_project_root (str): The absolute path to the user's current active project repository.
-        
+        node_id: Exact node_id from search or trace_callers output.
+        active_project_root: Absolute path to the repo root.
     """
     workspace_root = Path(active_project_root).resolve()
     
@@ -361,9 +381,12 @@ def fetch_node_source(node_id: str, active_project_root: str) -> str:
 
             # ──> THE CLASS ROUTER PATCH
             if node_type == "CLASS":
-                # Start with the core class signature and docstring chunk text
+                header = node_data.get("chunk_text", "# No header content available.")
+                header_lines = header.splitlines()
+                if len(header_lines) > 25:
+                    header = "\n".join(header_lines[:25]) + f"\n# ... class header truncated ({len(header_lines)} lines total)"
                 source_out = f"### RAW SOURCE CONTENT FOR CLASS NODE: `{node_id}`\n\n"
-                source_out += f"```python\n{node_data.get('chunk_text', '# No header content available.')}\n```\n\n"
+                source_out += f"```python\n{header}\n```\n\n"
                 source_out += "### INTERFACE MAP: AVAILABLE MEMBER METHODS WITHIN THIS CLASS\n"
                 source_out += "To read the operational logic of any method below, use 'fetch_node_source' with its absolute Node ID:\n"
                 
@@ -376,13 +399,66 @@ def fetch_node_source(node_id: str, active_project_root: str) -> str:
                         
                 if not found_methods:
                     source_out += "  (No child methods indexed for this class block.)\n"
-                return source_out
+                return source_out + _graph_neighbors_footer(G, node_id)
 
-            # ──> STANDARD FUNCTION/FILE FALLBACK (Keeps your original behavior intact)
             else:
-                return f"### RAW SOURCE CONTENT FOR NODE: `{node_id}`\n\n```python\n{node_data.get('chunk_text', '# No content available.')}\n```"
+                source = node_data.get("chunk_text", "# No content available.")
+                alt_id = None
+                if _is_stub_source(source):
+                    alt_id = _find_impl_alternate(G, node_id, node_data)
+                    if alt_id:
+                        node_id = alt_id
+                        node_data = G.nodes[node_id]
+                        source = node_data.get("chunk_text", source)
+                MAX_LINES = 150
+                lines = source.splitlines()
+                if len(lines) > MAX_LINES:
+                    source = "\n".join(lines[:MAX_LINES])
+                    source += f"\n\n# ... truncated ({len(lines)} lines total). Use trace_callers or fetch another node_id from search neighbors."
+                note = f" (resolved from stub to `{node_id}`)" if alt_id else ""
+                body = f"### RAW SOURCE CONTENT FOR NODE: `{node_id}`{note}\n\n```python\n{source}\n```"
+                return body + _graph_neighbors_footer(G, node_id)
 
         return f"### [Graph-RAG System Message]\nNode ID '{node_id}' not found."
+    finally:
+        model_manager.release()
+
+
+@mcp.tool()
+def trace_callers(node_id: str, active_project_root: str) -> str:
+    """List callers and callees for a node_id. Use when neighbors are missing or insufficient.
+    Then fetch_node_source on the relevant caller/callee — do not search again.
+
+    Args:
+        node_id: Exact node_id from search or fetch.
+        active_project_root: Absolute path to the repo root.
+    """
+    workspace_root = Path(active_project_root).resolve()
+    graph_path, lock_path = get_graph_paths(workspace_root)
+
+    embedder = model_manager.acquire()
+    try:
+        with FileLock(lock_path):
+            G = GraphSerializer.load_from_json(workspace_root, graph_path)
+            if execute_preflight_lazy_sync(workspace_root, G, embedder):
+                GraphSerializer.save_to_json(G, workspace_root, graph_path)
+
+        if not G.has_node(node_id):
+            return f"### [Graph-RAG System Message]\nNode ID '{node_id}' not found."
+
+        callers, callees = get_call_neighbors(G, node_id)
+        out = f"### Call graph for `{node_id}`\n\n"
+        if callers:
+            out += "**Callers** (fetch these for orchestration logic):\n"
+            for c in callers:
+                out += f"- `{c}`\n"
+        else:
+            out += "*No CALLS edges found for callers.*\n"
+        if callees:
+            out += "\n**Callees**:\n"
+            for c in callees:
+                out += f"- `{c}`\n"
+        return out
     finally:
         model_manager.release()
 

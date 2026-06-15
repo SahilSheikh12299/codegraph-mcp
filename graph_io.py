@@ -5,7 +5,7 @@ from pathlib import Path
 import networkx as nx
 from networkx.readwrite import json_graph
 from typing import Any, Dict, List, Tuple
-from fileParsing import WorkspaceScanner, ImportTracker, ASTParser
+from fileParsing import WorkspaceScanner, ImportTracker, ASTParser, extract_file_entities
 from buildGraph import RepositoryGraphCompiler, CodeChunker
 
 
@@ -91,6 +91,7 @@ class GraphSerializer:
                     "classes": ast_data.get("classes", []),
                     "functions": ast_data.get("functions", []),
                     "globals": ast_data.get("globals", []),
+                    "top_level_calls": ast_data.get("top_level_calls", []),
                     "internal_imports": import_data.get("internal_paths", []),
                     "external_imports": import_data.get("external_modules", [])
                 }
@@ -104,6 +105,14 @@ class GraphSerializer:
             # This will update the graph with code chunks
             _ = chunker.extract_and_bind_chunks() 
             G = chunker.graph
+
+            for file_path in python_files:
+                repo_relative_path = str(file_path.relative_to(repo_root))
+                for node_id, data in extract_file_entities(repo_relative_path, repo_root).items():
+                    if G.has_node(node_id):
+                        G.nodes[node_id]["chunk_text"] = data["chunk_text"]
+            G.graph["chunk_schema"] = 2
+            G.graph["calls_schema"] = 1
 
             # Output detailed diagnostics to verify your metrics
             summary = code_graph_instance.get_summary()

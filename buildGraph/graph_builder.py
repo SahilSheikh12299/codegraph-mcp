@@ -184,6 +184,107 @@ class CodeGraph:
         }
 
 
+def resolve_callee_id(
+    G: nx.DiGraph,
+    file_path: str,
+    called_symbol: str,
+    class_name: str | None,
+    global_func_registry: Dict[str, str],
+    internal_imports: List[str],
+) -> str | None:
+    """Resolve a called symbol to a graph node_id."""
+    candidates: List[str] = []
+    if class_name:
+        candidates.append(f"{file_path}::{class_name}.{called_symbol}")
+    candidates.append(f"{file_path}::{called_symbol}")
+
+    for cid in candidates:
+        if G.has_node(cid):
+            return cid
+
+    for nid, d in G.nodes(data=True):
+        if d.get("file_path") == file_path and d.get("name") == called_symbol and d.get("type") == "FUNCTION":
+            return nid
+
+    if called_symbol in global_func_registry:
+        defining_file = global_func_registry[called_symbol]
+        if defining_file in internal_imports:
+            callee_id = f"{defining_file}::{called_symbol}"
+            if G.has_node(callee_id):
+                return callee_id
+    return None
+
+
+def wire_calls_for_file(
+    G: nx.DiGraph,
+    file_path: str,
+    assets: dict,
+    global_func_registry: Dict[str, str],
+) -> None:
+    """Wire CALLS edges for one file's functions and class methods."""
+    internal_imports: List[str] = assets.get("internal_imports", [])
+    file_id = file_path
+
+    for func in assets.get("functions", []):
+        caller_id = f"{file_path}::{func['name']}"
+        if not G.has_node(caller_id):
+            continue
+        for called_symbol in func.get("calls", []):
+            callee_id = resolve_callee_id(
+                G, file_path, called_symbol, None, global_func_registry, internal_imports
+            )
+            if callee_id:
+                G.add_edge(caller_id, callee_id, relationship="CALLS")
+
+    for cls in assets.get("classes", []):
+        for method in cls.get("methods", []):
+            caller_id = f"{file_path}::{cls['name']}.{method['name']}"
+            if not G.has_node(caller_id):
+                continue
+            for called_symbol in method.get("calls", []):
+                callee_id = resolve_callee_id(
+                    G, file_path, called_symbol, cls["name"], global_func_registry, internal_imports
+                )
+                if callee_id:
+                    G.add_edge(caller_id, callee_id, relationship="CALLS")
+
+    for called_symbol in assets.get("top_level_calls", []):
+        callee_id = resolve_callee_id(
+            G, file_path, called_symbol, None, global_func_registry, internal_imports
+        )
+        if callee_id:
+            G.add_edge(file_id, callee_id, relationship="CALLS")
+
+
+def build_func_registry_from_graph(G: nx.DiGraph) -> Dict[str, str]:
+    """Map bare function/class names to defining file paths."""
+    registry: Dict[str, str] = {}
+    for _, d in G.nodes(data=True):
+        ntype = d.get("type")
+        name, fpath = d.get("name"), d.get("file_path")
+        if not name or not fpath:
+            continue
+        if ntype == "CLASS" or (ntype == "FUNCTION" and not d.get("is_method")):
+            registry[name] = fpath
+    return registry
+
+
+def strip_calls_edges(G: nx.DiGraph) -> None:
+    to_remove = [(u, v) for u, v, d in G.edges(data=True) if d.get("relationship") == "CALLS"]
+    G.remove_edges_from(to_remove)
+
+
+def strip_calls_edges_for_file(G: nx.DiGraph, rel_path: str) -> None:
+    file_nodes = {
+        nid for nid, d in G.nodes(data=True)
+        if d.get("file_path") == rel_path or nid == rel_path
+    }
+    to_remove = [
+        (u, v) for u, v, d in G.edges(data=True)
+        if d.get("relationship") == "CALLS" and (u in file_nodes or v in file_nodes)
+    ]
+    G.remove_edges_from(to_remove)
+
 
 class RepositoryGraphCompiler:
     """Consumes parsed structural metadata JSON and compiles a unified,
@@ -296,41 +397,10 @@ class RepositoryGraphCompiler:
                             parent_class_id = f"{defining_file}::{base_class_name}"
                             self.cg.add_inherits_edge(class_id, parent_class_id)
 
-            # Step C: Wire Function-to-Function / Function-to-Class CALLS relationships
-            for func in assets.get("functions", []):
-                caller_id = f"{file_path}::{func['name']}"
-                
-                for called_symbol in func.get("calls", []):
-                    # Scenario A: The called target lives in the exact same file
-                    local_id = f"{file_path}::{called_symbol}"
-                    if self.cg.graph.has_node(local_id):
-                        self.cg.add_calls_edge(caller_id, local_id)
-                        continue
-                        
-                    # Scenario B: The called target was imported from another internal repository file
-                    if called_symbol in global_func_registry:
-                        defining_file = global_func_registry[called_symbol]
-                        # Verify the caller file actually imports the file where the target is defined
-                        if defining_file in internal_imports:
-                            callee_id = f"{defining_file}::{called_symbol}"
-                            if self.cg.graph.has_node(callee_id):
-                                self.cg.add_calls_edge(caller_id, callee_id)
-
-            # Step D: Wire FILE-to-FUNCTION / FILE-to-CLASS root-level execution calls
-            for called_symbol in assets.get("top_level_calls", []):
-                # Scenario A: The called script target lives in the exact same file
-                local_id = f"{file_path}::{called_symbol}"
-                if self.cg.graph.has_node(local_id):
-                    self.cg.add_calls_edge(file_id, local_id) # Edge originates from file_id!
-                    continue
-                    
-                # Scenario B: The called script target was imported from an internal module
-                if called_symbol in global_func_registry:
-                    defining_file = global_func_registry[called_symbol]
-                    if defining_file in internal_imports:
-                        callee_id = f"{defining_file}::{called_symbol}"
-                        if self.cg.graph.has_node(callee_id):
-                            self.cg.add_calls_edge(file_id, callee_id) # Edge originates from file_id!
+            # Step C + D: Wire CALLS for functions, methods, and top-level calls
+            wire_calls_for_file(
+                self.cg.graph, file_path, assets, global_func_registry
+            )
         print("[Compilation Complete] Repository network successfully mapped.")
         return self.cg
 

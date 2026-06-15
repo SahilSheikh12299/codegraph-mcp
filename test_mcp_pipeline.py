@@ -6,8 +6,10 @@ sys.path.append(str(Path(__file__).parent.resolve()))
 
 try:
     # Import the fixed functions directly from your server file
-    from mcp_server import calculate_blast_radius, search_codebase_intent, get_graph_paths
+    from mcp_server import calculate_blast_radius, search_codebase_intent, get_graph_paths, trace_callers, fetch_node_source, execute_preflight_lazy_sync
     from graph_io import GraphSerializer
+    from advanced_engine import get_call_neighbors
+    from embeddingPipeline import EmbeddingModelLifecycleManager
 except ImportError as e:
     print(f"❌ Import Error: Make sure this script is placed next to your mcp_server.py and graph_io.py files.")
     print(f"Details: {e}")
@@ -103,6 +105,42 @@ def run_system_audit():
         
     except Exception as e:
         print(f"  ❌ Crash during Blast Radius Execution Phase!")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # -------------------------------------------------------------------------
+    # STEP 4: Validate CALLS graph navigation (redirect flow)
+    # -------------------------------------------------------------------------
+    print("\n▶️ STEP 4: Validating CALLS edges for redirect navigation...")
+    resolve_nid = "src/requests/sessions.py::SessionRedirectMixin.resolve_redirects"
+    try:
+        mm = EmbeddingModelLifecycleManager()
+        emb = mm.acquire()
+        try:
+            G = GraphSerializer.load_from_json(project_path, json_path)
+            if execute_preflight_lazy_sync(project_path, G, emb):
+                GraphSerializer.save_to_json(G, project_path, json_path)
+            callers, callees = get_call_neighbors(G, resolve_nid)
+            print(f"  calls_schema: {G.graph.get('calls_schema')}")
+            print(f"  callers: {callers}")
+            print(f"  callees (first 5): {callees[:5]}")
+            if not any("Session.send" in c for c in callers):
+                print("  FAIL: Session.send not found in callers of resolve_redirects")
+            elif not any("get_redirect_target" in c for c in callees):
+                print("  FAIL: get_redirect_target not found in callees")
+            else:
+                print("  PASS: redirect CALLS edges wired correctly")
+            trace_out = trace_callers(resolve_nid, TEST_PROJECT_ROOT)
+            fetch_out = fetch_node_source(resolve_nid, TEST_PROJECT_ROOT)
+            if "Graph neighbors" not in fetch_out:
+                print("  FAIL: fetch_node_source missing Graph neighbors footer")
+            else:
+                print("  PASS: fetch includes graph neighbors")
+        finally:
+            mm.release()
+    except Exception as e:
+        print(f"  Crash during CALLS validation: {e}")
         import traceback
         traceback.print_exc()
         return
