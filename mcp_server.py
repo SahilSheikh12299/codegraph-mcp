@@ -20,7 +20,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Import your validated local analytical engine modules
 from graph_io import GraphSerializer
 from embeddingPipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
-from advanced_engine import AdvancedRetrievalEngine, format_call_neighbors, get_call_neighbors
+from advanced_engine import (
+    AdvancedRetrievalEngine,
+    format_call_neighbors,
+    get_call_neighbors,
+    recompute_call_centrality,
+)
 from buildGraph import (
     wire_calls_for_file,
     build_func_registry_from_graph,
@@ -144,12 +149,14 @@ def _rewire_all_calls(G: nx.DiGraph, repo_root: Path) -> None:
     for rel_path in sorted(tracked):
         if (repo_root / rel_path).exists():
             wire_calls_for_file(G, rel_path, _parse_file_call_assets(repo_root, rel_path, tracker), registry)
+    recompute_call_centrality(G)
 
 
 def _rewire_file_calls(G: nx.DiGraph, repo_root: Path, rel_path: str, tracker: ImportTracker) -> None:
     strip_calls_edges_for_file(G, rel_path)
     registry = build_func_registry_from_graph(G)
     wire_calls_for_file(G, rel_path, _parse_file_call_assets(repo_root, rel_path, tracker), registry)
+    recompute_call_centrality(G)
 
 
 def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalEmbeddingPipeline) -> bool:
@@ -177,6 +184,9 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
         _rewire_all_calls(G, repo_root)
         G.graph["calls_schema"] = 1
         schema_dirty = True
+    elif G.graph.get("centrality_schema") != 1:
+        recompute_call_centrality(G)
+        schema_dirty = True
 
     if schema_dirty:
         return True
@@ -184,6 +194,7 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
     dirty_files_detected = False
     first_run_initialization = False
     import_tracker: ImportTracker | None = None
+    calls_graph_changed = False
 
     for rel_path in list(tracked_files):
         if not (repo_root / rel_path).exists():
@@ -193,6 +204,7 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
             G.graph["indexed_timestamps"].pop(rel_path, None)
             tracked_files.discard(rel_path)
             dirty_files_detected = True
+            calls_graph_changed = True
 
     current_files = {str(p.relative_to(repo_root)) for p in WorkspaceScanner(repo_root).scan()}
     for rel_path in current_files - tracked_files:
@@ -287,6 +299,9 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
                 import_tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
             _rewire_file_calls(G, repo_root, rel_path, import_tracker)
 
+    if calls_graph_changed:
+        recompute_call_centrality(G)
+
     if first_run_initialization:
         return first_run_initialization
 
@@ -363,71 +378,72 @@ def calculate_blast_radius(target_symbol: str, active_project_root: str) -> str:
         model_manager.release()
 
 
+def _format_node_source(G: nx.DiGraph, node_id: str) -> str:
+    if not G.has_node(node_id):
+        return f"### [Graph-RAG System Message]\nNode ID '{node_id}' not found."
+
+    node_data = G.nodes[node_id]
+    node_type = node_data.get("type", "UNKNOWN")
+
+    if node_type == "CLASS":
+        header = node_data.get("chunk_text", "# No header content available.")
+        header_lines = header.splitlines()
+        if len(header_lines) > 25:
+            header = "\n".join(header_lines[:25]) + f"\n# ... class header truncated ({len(header_lines)} lines total)"
+        source_out = f"### RAW SOURCE CONTENT FOR CLASS NODE: `{node_id}`\n\n"
+        source_out += f"```python\n{header}\n```\n\n"
+        source_out += "### INTERFACE MAP: AVAILABLE MEMBER METHODS WITHIN THIS CLASS\n"
+        source_out += "To read the operational logic of any method below, use 'fetch_node_source' with its absolute Node ID:\n"
+
+        found_methods = False
+        for sub_id, sub_data in G.nodes(data=True):
+            if sub_data.get("belongs_to_class") == node_data.get("name") and sub_data.get("file_path") == node_data.get("file_path"):
+                source_out += f"  - [METHOD] `def {sub_data.get('name')}{sub_data.get('signature', '()')}` | Node ID: `{sub_id}`\n"
+                found_methods = True
+
+        if not found_methods:
+            source_out += "  (No child methods indexed for this class block.)\n"
+        return source_out + _graph_neighbors_footer(G, node_id)
+
+    source = node_data.get("chunk_text", "# No content available.")
+    alt_id = None
+    if _is_stub_source(source):
+        alt_id = _find_impl_alternate(G, node_id, node_data)
+        if alt_id:
+            node_id = alt_id
+            node_data = G.nodes[node_id]
+            source = node_data.get("chunk_text", source)
+    MAX_LINES = 150
+    lines = source.splitlines()
+    if len(lines) > MAX_LINES:
+        source = "\n".join(lines[:MAX_LINES])
+        source += f"\n\n# ... truncated ({len(lines)} lines total). Use trace_callers or fetch another node_id from search neighbors."
+    note = f" (resolved from stub to `{node_id}`)" if alt_id else ""
+    body = f"### RAW SOURCE CONTENT FOR NODE: `{node_id}`{note}\n\n```python\n{source}\n```"
+    return body + _graph_neighbors_footer(G, node_id)
+
+
 @mcp.tool()
-def fetch_node_source(node_id: str, active_project_root: str) -> str:
-    """Source for one node_id plus Graph neighbors (called_by, calls).
-    Follow neighbors to walk the call graph. Do not Read/Grep after a successful fetch.
+def fetch_node_source(node_ids: list[str], active_project_root: str) -> str:
+    """Source for one or more node_ids plus Graph neighbors (called_by, calls).
+    Pass multiple IDs in one call when following neighbors. Do not Read/Grep after a successful fetch.
 
     Args:
-        node_id: Exact node_id from search or trace_callers output.
+        node_ids: Exact node_id(s) from search or trace_callers output.
         active_project_root: Absolute path to the repo root.
     """
     workspace_root = Path(active_project_root).resolve()
-    
     graph_path, lock_path = get_graph_paths(workspace_root)
 
     embedder = model_manager.acquire()
     try:
         with FileLock(lock_path):
-            G = GraphSerializer.load_from_json(workspace_root,graph_path)
+            G = GraphSerializer.load_from_json(workspace_root, graph_path)
             if execute_preflight_lazy_sync(workspace_root, G, embedder):
                 GraphSerializer.save_to_json(G, workspace_root, graph_path)
-                
-        if G.has_node(node_id):
-            node_data = G.nodes[node_id]
-            node_type = node_data.get("type", "UNKNOWN")
 
-            # ──> THE CLASS ROUTER PATCH
-            if node_type == "CLASS":
-                header = node_data.get("chunk_text", "# No header content available.")
-                header_lines = header.splitlines()
-                if len(header_lines) > 25:
-                    header = "\n".join(header_lines[:25]) + f"\n# ... class header truncated ({len(header_lines)} lines total)"
-                source_out = f"### RAW SOURCE CONTENT FOR CLASS NODE: `{node_id}`\n\n"
-                source_out += f"```python\n{header}\n```\n\n"
-                source_out += "### INTERFACE MAP: AVAILABLE MEMBER METHODS WITHIN THIS CLASS\n"
-                source_out += "To read the operational logic of any method below, use 'fetch_node_source' with its absolute Node ID:\n"
-                
-                found_methods = False
-                # Scan the graph for functions belonging to this class in the same file
-                for sub_id, sub_data in G.nodes(data=True):
-                    if sub_data.get("belongs_to_class") == node_data.get("name") and sub_data.get("file_path") == node_data.get("file_path"):
-                        source_out += f"  - [METHOD] `def {sub_data.get('name')}{sub_data.get('signature', '()')}` | Node ID: `{sub_id}`\n"
-                        found_methods = True
-                        
-                if not found_methods:
-                    source_out += "  (No child methods indexed for this class block.)\n"
-                return source_out + _graph_neighbors_footer(G, node_id)
-
-            else:
-                source = node_data.get("chunk_text", "# No content available.")
-                alt_id = None
-                if _is_stub_source(source):
-                    alt_id = _find_impl_alternate(G, node_id, node_data)
-                    if alt_id:
-                        node_id = alt_id
-                        node_data = G.nodes[node_id]
-                        source = node_data.get("chunk_text", source)
-                MAX_LINES = 150
-                lines = source.splitlines()
-                if len(lines) > MAX_LINES:
-                    source = "\n".join(lines[:MAX_LINES])
-                    source += f"\n\n# ... truncated ({len(lines)} lines total). Use trace_callers or fetch another node_id from search neighbors."
-                note = f" (resolved from stub to `{node_id}`)" if alt_id else ""
-                body = f"### RAW SOURCE CONTENT FOR NODE: `{node_id}`{note}\n\n```python\n{source}\n```"
-                return body + _graph_neighbors_footer(G, node_id)
-
-        return f"### [Graph-RAG System Message]\nNode ID '{node_id}' not found."
+        parts = [_format_node_source(G, node_id) for node_id in node_ids]
+        return "\n\n---\n\n".join(parts)
     finally:
         model_manager.release()
 
