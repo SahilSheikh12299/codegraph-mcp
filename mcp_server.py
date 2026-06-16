@@ -4,6 +4,7 @@ import sys
 import gc
 import logging
 import hashlib
+import json
 from pathlib import Path
 import networkx as nx
 from mcp.server.fastmcp import FastMCP
@@ -22,9 +23,12 @@ from graph_io import GraphSerializer
 from embeddingPipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
 from advanced_engine import (
     AdvancedRetrievalEngine,
+    extract_source_excerpt,
     format_call_neighbors,
     get_call_neighbors,
     recompute_call_centrality,
+    NEIGHBOR_ID_LIMIT,
+    SOURCE_EXCERPT_MAX_LINES,
 )
 from buildGraph import (
     wire_calls_for_file,
@@ -72,6 +76,100 @@ def _graph_neighbors_footer(G: nx.DiGraph, node_id: str) -> str:
     if not neighbors:
         return ""
     return f"\n\n### Graph neighbors\n{neighbors}"
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _get_capped_call_neighbors(G: nx.DiGraph, node_id: str, neighbors_max: int) -> dict:
+    """Return callers/callees node_ids capped to neighbors_max with *_more counts."""
+    if not G.has_node(node_id):
+        return {"callers": [], "callees": [], "callers_more": 0, "callees_more": 0}
+
+    callers_all = sorted(
+        p for p in G.predecessors(node_id) if G.edges[p, node_id].get("relationship") == "CALLS"
+    )
+    callees_all = sorted(
+        s for s in G.successors(node_id) if G.edges[node_id, s].get("relationship") == "CALLS"
+    )
+
+    callers = callers_all[: max(0, neighbors_max)]
+    callees = callees_all[: max(0, neighbors_max)]
+    return {
+        "callers": callers,
+        "callees": callees,
+        "callers_more": max(0, len(callers_all) - len(callers)),
+        "callees_more": max(0, len(callees_all) - len(callees)),
+        "callers_count": len(callers_all),
+        "callees_count": len(callees_all),
+    }
+
+
+def _render_neighbors_markdown(neighbors: dict) -> str:
+    lines: list[str] = []
+    callers = neighbors.get("callers") or []
+    callees = neighbors.get("callees") or []
+    if callers:
+        lines.append(f"- called_by: {', '.join(f'`{c}`' for c in callers)}")
+        more = int(neighbors.get("callers_more") or 0)
+        if more:
+            lines.append(f"  - ... and {more} more caller(s)")
+    if callees:
+        lines.append(f"- calls: {', '.join(f'`{c}`' for c in callees)}")
+        more = int(neighbors.get("callees_more") or 0)
+        if more:
+            lines.append(f"  - ... and {more} more callee(s)")
+    return "\n".join(lines)
+
+
+def _extract_docstring(source: str) -> str | None:
+    # Best-effort: first triple-quoted literal after signature.
+    m = re.search(r'^[ \t]*(?:"""|\'\'\')([\s\S]*?)(?:"""|\'\'\')', source, re.MULTILINE)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _slice_source(source: str, slices: list[str]) -> dict:
+    lines = source.splitlines()
+    out: dict[str, Any] = {}
+
+    if "signature" in slices:
+        sig_lines: list[str] = []
+        for ln in lines[:25]:
+            if ln.lstrip().startswith(("def ", "async def ", "class ")):
+                sig_lines.append(ln)
+                break
+        out["signature_lines"] = sig_lines
+
+    if "docstring" in slices:
+        out["docstring"] = _extract_docstring(source)
+
+    if "args" in slices:
+        # Minimal: include the signature line only (arguments are inside it).
+        out["args_hint"] = "See signature_lines"
+
+    def _cap_matches(prefixes: tuple[str, ...], cap: int = 12) -> list[str]:
+        matches = []
+        for ln in lines:
+            s = ln.lstrip()
+            if s.startswith(prefixes):
+                matches.append(ln)
+                if len(matches) >= cap:
+                    break
+        return matches
+
+    if "returns" in slices:
+        out["return_lines"] = _cap_matches(("return ",))
+    if "raises" in slices:
+        out["raise_lines"] = _cap_matches(("raise ",))
+    if "ifs" in slices:
+        out["if_lines"] = _cap_matches(("if ", "elif ", "else:"))
+    if "loops" in slices:
+        out["loop_lines"] = _cap_matches(("for ", "while "))
+
+    return out
 
 
 def get_graph_paths(active_project_root: str | Path) -> Tuple[Path, Path]:
@@ -312,36 +410,52 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
 # 3. NATIVE MCP CODE ENVIRONMENT TOOLS REGISTRATION
 # =========================================================================
 @mcp.tool()
-def search_codebase_intent(search_queries: list[str], active_project_root: str, targeted_symbols: list[str] = None) -> str:
-    """Find code by intent. Returns node_id, called_by, and calls — not source.
-    Workflow: one search → fetch top hit → follow neighbors or trace_callers. No second search.
+def search_codebase_intent(
+    search_queries: list[str],
+    active_project_root: str,
+    targeted_symbols: list[str] = None,
+    top_k: int = 8,
+    format: str = "json",
+    include_next_action: bool = True,
+) -> str:
+    """Find code by intent. Returns top 2 hits with capped source + neighbor IDs.
 
     Args:
-        search_queries: One keyword-dense string per topic. Multiple only for separate subsystems.
+        search_queries: Keyword-dense strings, e.g. ["redirect Location 301", "resolve_redirects"].
         active_project_root: Absolute path to the repo root.
-        targeted_symbols: Optional identifiers from the user's message, e.g. ["Session"].
+        targeted_symbols: Deprecated — ignored. Put identifiers in search_queries instead.
+        top_k: Max candidates to return (top 2 include source_excerpt).
+        format: "json" (default) or "markdown".
+        include_next_action: If true, suggest fetch_node_source for the top hit.
     """
-    # Workspace root is the project dir where cursor has been opened
     workspace_root = Path(active_project_root).resolve()
-    
-    # This function hashes the workspace dir value and then just gives us the graph and lock path of it
     graph_path, lock_path = get_graph_paths(workspace_root)
-    
+
     embedder = model_manager.acquire()
     try:
         with FileLock(lock_path):
-            G = GraphSerializer.load_from_json(workspace_root,graph_path)
+            G = GraphSerializer.load_from_json(workspace_root, graph_path)
             if execute_preflight_lazy_sync(workspace_root, G, embedder):
                 GraphSerializer.save_to_json(G, workspace_root, graph_path)
-                
+
         engine = AdvancedRetrievalEngine(graph_instance=G, embedder_instance=embedder)
-        return engine.compile_context_package(search_queries=search_queries, targeted_symbols=targeted_symbols)
+        return engine.compile_context_package(
+            search_queries=search_queries,
+            top_k=top_k,
+            output_format=format,
+            include_next_action=include_next_action,
+        )
     finally:
         model_manager.release()
 
 
 @mcp.tool()
-def calculate_blast_radius(target_symbol: str, active_project_root: str) -> str:
+def calculate_blast_radius(
+    target_symbol: str,
+    active_project_root: str,
+    format: str = "markdown",
+    max_items: int = 50,
+) -> str:
     """List upstream dependents before editing code. Not for discovery-only questions.
 
     Args:
@@ -367,69 +481,133 @@ def calculate_blast_radius(target_symbol: str, active_project_root: str) -> str:
             
         impact_profiles = engine.compute_upstream_blast_radius(matching_nodes)
         
+        impact_profiles = sorted(
+            impact_profiles,
+            key=lambda x: (x.get("file_path") or "", x.get("node_id") or ""),
+        )
+
+        if format == "json":
+            items = impact_profiles[: max(0, max_items)]
+            return _json_dumps(
+                {
+                    "target_symbol": target_symbol,
+                    "matched_nodes": matching_nodes,
+                    "total_affected": len(impact_profiles),
+                    "items": items,
+                    "more": max(0, len(impact_profiles) - len(items)),
+                }
+            )
+
         report = f"### UPSTREAM REGRESSION AUDIT FOR SYMBOL: `{target_symbol}`\n"
         report += f"Modifying this entity creates a direct domino risk across **{len(impact_profiles)}** elements.\n\n"
-        
-        for item in impact_profiles:
+
+        shown = impact_profiles[: max(0, max_items)]
+        for item in shown:
             report += f"- **[{item['type']}]** `{item['node_id']}` inside `{item['file_path']}`\n"
-            
+        more = len(impact_profiles) - len(shown)
+        if more > 0:
+            report += f"\n... and {more} more.\n"
+
         return report
     finally:
         model_manager.release()
 
 
-def _format_node_source(G: nx.DiGraph, node_id: str) -> str:
+def _build_node_payload(
+    G: nx.DiGraph,
+    node_id: str,
+    *,
+    neighbors_max: int = NEIGHBOR_ID_LIMIT,
+) -> dict[str, Any]:
+    """Single node: capped source_excerpt + 1-hop neighbor IDs."""
     if not G.has_node(node_id):
-        return f"### [Graph-RAG System Message]\nNode ID '{node_id}' not found."
+        return {"node_id": node_id, "error": f"Node ID '{node_id}' not found."}
 
     node_data = G.nodes[node_id]
     node_type = node_data.get("type", "UNKNOWN")
+    resolved_id = node_id
+    chunk_text = node_data.get("chunk_text", "")
 
-    if node_type == "CLASS":
-        header = node_data.get("chunk_text", "# No header content available.")
-        header_lines = header.splitlines()
-        if len(header_lines) > 25:
-            header = "\n".join(header_lines[:25]) + f"\n# ... class header truncated ({len(header_lines)} lines total)"
-        source_out = f"### RAW SOURCE CONTENT FOR CLASS NODE: `{node_id}`\n\n"
-        source_out += f"```python\n{header}\n```\n\n"
-        source_out += "### INTERFACE MAP: AVAILABLE MEMBER METHODS WITHIN THIS CLASS\n"
-        source_out += "To read the operational logic of any method below, use 'fetch_node_source' with its absolute Node ID:\n"
-
-        found_methods = False
-        for sub_id, sub_data in G.nodes(data=True):
-            if sub_data.get("belongs_to_class") == node_data.get("name") and sub_data.get("file_path") == node_data.get("file_path"):
-                source_out += f"  - [METHOD] `def {sub_data.get('name')}{sub_data.get('signature', '()')}` | Node ID: `{sub_id}`\n"
-                found_methods = True
-
-        if not found_methods:
-            source_out += "  (No child methods indexed for this class block.)\n"
-        return source_out + _graph_neighbors_footer(G, node_id)
-
-    source = node_data.get("chunk_text", "# No content available.")
-    alt_id = None
-    if _is_stub_source(source):
+    if node_type != "CLASS" and _is_stub_source(chunk_text):
         alt_id = _find_impl_alternate(G, node_id, node_data)
         if alt_id:
-            node_id = alt_id
-            node_data = G.nodes[node_id]
-            source = node_data.get("chunk_text", source)
-    MAX_LINES = 150
-    lines = source.splitlines()
-    if len(lines) > MAX_LINES:
-        source = "\n".join(lines[:MAX_LINES])
-        source += f"\n\n# ... truncated ({len(lines)} lines total). Use trace_callers or fetch another node_id from search neighbors."
-    note = f" (resolved from stub to `{node_id}`)" if alt_id else ""
-    body = f"### RAW SOURCE CONTENT FOR NODE: `{node_id}`{note}\n\n```python\n{source}\n```"
-    return body + _graph_neighbors_footer(G, node_id)
+            resolved_id = alt_id
+            node_data = G.nodes[resolved_id]
+            chunk_text = node_data.get("chunk_text", chunk_text)
+
+    callers, callees = get_call_neighbors(G, resolved_id, limit=neighbors_max)
+    neighbors = {"callers": callers, "callees": callees}
+
+    payload: dict[str, Any] = {
+        "node_id": resolved_id,
+        "type": node_type,
+        "file_path": node_data.get("file_path"),
+        "name": node_data.get("name"),
+        "signature": node_data.get("signature", ""),
+        "source_excerpt": extract_source_excerpt(chunk_text, node_type, SOURCE_EXCERPT_MAX_LINES),
+        "neighbors": neighbors,
+    }
+
+    if node_type == "CLASS":
+        payload["methods"] = [
+            {
+                "node_id": sub_id,
+                "name": sub_data.get("name"),
+                "signature": sub_data.get("signature", "()"),
+            }
+            for sub_id, sub_data in G.nodes(data=True)
+            if sub_data.get("belongs_to_class") == node_data.get("name")
+            and sub_data.get("file_path") == node_data.get("file_path")
+        ][:50]
+
+    if resolved_id != node_id:
+        payload["resolved_stub_from"] = node_id
+
+    return payload
+
+
+def _format_node_source(
+    G: nx.DiGraph,
+    node_id: str,
+    *,
+    mode: str = "excerpt",
+    slices: list[str] | None = None,
+    max_lines: int = SOURCE_EXCERPT_MAX_LINES,
+    include_neighbors: bool = True,
+    neighbors_max: int = NEIGHBOR_ID_LIMIT,
+    format: str = "json",
+) -> str:
+    """Backward-compatible wrapper; always returns capped excerpt + neighbor IDs."""
+    payload = _build_node_payload(G, node_id, neighbors_max=neighbors_max)
+    if format == "json":
+        return _json_dumps(payload)
+
+    if payload.get("error"):
+        return f"### [Graph-RAG System Message]\n{payload['error']}"
+
+    body = f"### Source for `{payload['node_id']}`\n\n```python\n{payload.get('source_excerpt', '')}\n```"
+    neighbors = payload.get("neighbors") or {}
+    rendered = _render_neighbors_markdown(neighbors)
+    if rendered:
+        body += f"\n\n### Graph neighbors\n{rendered}"
+    return body
 
 
 @mcp.tool()
-def fetch_node_source(node_ids: list[str], active_project_root: str) -> str:
-    """Source for one or more node_ids plus Graph neighbors (called_by, calls).
-    Pass multiple IDs in one call when following neighbors. Do not Read/Grep after a successful fetch.
+def fetch_node_source(
+    node_ids: list[str],
+    active_project_root: str,
+    mode: str = "excerpt",
+    slices: list[str] | None = None,
+    max_lines: int = SOURCE_EXCERPT_MAX_LINES,
+    include_neighbors: bool = True,
+    neighbors_max: int = NEIGHBOR_ID_LIMIT,
+    format: str = "json",
+) -> str:
+    """Capped source excerpt + 1-hop neighbor IDs for one or more node_ids.
 
     Args:
-        node_ids: Exact node_id(s) from search or trace_callers output.
+        node_ids: Exact node_id(s) from search output neighbors or candidates.
         active_project_root: Absolute path to the repo root.
     """
     workspace_root = Path(active_project_root).resolve()
@@ -442,49 +620,46 @@ def fetch_node_source(node_ids: list[str], active_project_root: str) -> str:
             if execute_preflight_lazy_sync(workspace_root, G, embedder):
                 GraphSerializer.save_to_json(G, workspace_root, graph_path)
 
-        parts = [_format_node_source(G, node_id) for node_id in node_ids]
+        nodes = [
+            _build_node_payload(G, node_id, neighbors_max=neighbors_max)
+            for node_id in node_ids
+        ]
+        if format == "json":
+            return _json_dumps({"nodes": nodes})
+
+        parts = [
+            _format_node_source(
+                G,
+                node_id,
+                neighbors_max=neighbors_max,
+                format="markdown",
+            )
+            for node_id in node_ids
+        ]
         return "\n\n---\n\n".join(parts)
     finally:
         model_manager.release()
 
 
 @mcp.tool()
-def trace_callers(node_id: str, active_project_root: str) -> str:
-    """List callers and callees for a node_id. Use when neighbors are missing or insufficient.
-    Then fetch_node_source on the relevant caller/callee — do not search again.
-
-    Args:
-        node_id: Exact node_id from search or fetch.
-        active_project_root: Absolute path to the repo root.
-    """
-    workspace_root = Path(active_project_root).resolve()
-    graph_path, lock_path = get_graph_paths(workspace_root)
-
-    embedder = model_manager.acquire()
-    try:
-        with FileLock(lock_path):
-            G = GraphSerializer.load_from_json(workspace_root, graph_path)
-            if execute_preflight_lazy_sync(workspace_root, G, embedder):
-                GraphSerializer.save_to_json(G, workspace_root, graph_path)
-
-        if not G.has_node(node_id):
-            return f"### [Graph-RAG System Message]\nNode ID '{node_id}' not found."
-
-        callers, callees = get_call_neighbors(G, node_id)
-        out = f"### Call graph for `{node_id}`\n\n"
-        if callers:
-            out += "**Callers** (fetch these for orchestration logic):\n"
-            for c in callers:
-                out += f"- `{c}`\n"
-        else:
-            out += "*No CALLS edges found for callers.*\n"
-        if callees:
-            out += "\n**Callees**:\n"
-            for c in callees:
-                out += f"- `{c}`\n"
-        return out
-    finally:
-        model_manager.release()
+def trace_callers(
+    node_id: str,
+    active_project_root: str,
+    format: str = "json",
+    max_items: int = 50,
+) -> str:
+    """Deprecated. Use fetch_node_source — it includes 1-hop callers and callees."""
+    msg = {
+        "deprecated": True,
+        "message": "trace_callers is deprecated. Use fetch_node_source(node_ids=[...]) which includes 1-hop callers and callees.",
+        "use_instead": {
+            "tool": "fetch_node_source",
+            "args": {"node_ids": [node_id]},
+        },
+    }
+    if format == "json":
+        return _json_dumps(msg)
+    return msg["message"]
 
 
 if __name__ == "__main__":

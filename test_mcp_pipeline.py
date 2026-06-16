@@ -1,5 +1,6 @@
 """End-to-end check of Graph-RAG MCP tools on the requests test repo."""
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -25,12 +26,18 @@ except ImportError as e:
 
 # --- test inputs ---
 TEST_PROJECT_ROOT = "/Users/sahilsheikh/Documents/Djikstra-codebase/repo-understanding-engine/test_repos/requests"
-SEARCH_QUERIES = ["How does Session retry on 429 status codes?"]
-TARGETED_SYMBOLS = ["Session"]
+SEARCH_QUERIES = ["Session retry 429 status code"]
 BLAST_RADIUS_SYMBOL = "Session"
 CALL_GRAPH_NODE = "src/requests/sessions.py::SessionRedirectMixin.resolve_redirects"
 EXPECTED_CALLER_FRAGMENT = "Session.send"
 EXPECTED_CALLEE_FRAGMENT = "get_redirect_target"
+
+REDIRECT_SEARCH_QUERIES = [
+    "HTTP redirect response follow Location header 301 302",
+    "resolve_redirects allow_redirects",
+    "is_redirect status code",
+]
+REDIRECT_TOP_NODE = "src/requests/sessions.py::SessionRedirectMixin.resolve_redirects"
 
 
 def _parse_search_hits(markdown: str) -> list[dict]:
@@ -40,17 +47,13 @@ def _parse_search_hits(markdown: str) -> list[dict]:
     blocks = re.split(r"### Hit \d+:", markdown)
     for block in blocks[1:]:
         node_match = re.match(r"\s*`([^`]+)`", block)
-        score_match = re.search(
-            r"hybrid_score:\s*([\d.]+)\s*\|\s*callers:\s*(\d+)\s*\|\s*match:\s*(\S+)",
-            block,
-        )
+        score_match = re.search(r"score:\s*([\d.]+)\s*\|\s*callers:\s*(\d+)", block)
         if node_match and score_match:
             hits.append(
                 {
                     "node_id": node_match.group(1),
                     "hybrid_score": float(score_match.group(1)),
                     "callers": int(score_match.group(2)),
-                    "match": score_match.group(3),
                 }
             )
     return hits
@@ -72,6 +75,19 @@ def _verdict(passed: bool, reason: str) -> bool:
     return passed
 
 
+def _redirect_answerable_from_search(parsed: dict) -> bool:
+    """Top hit should be redirect-related and include enough excerpt to answer."""
+    candidates = parsed.get("candidates") or []
+    if not candidates:
+        return False
+    top = candidates[0]
+    node_id = top.get("node_id", "")
+    excerpt = top.get("source_excerpt", "")
+    redirectish = "redirect" in node_id.lower() or "redirect" in excerpt.lower()
+    has_neighbors = bool(top.get("neighbors", {}).get("callers") or top.get("neighbors", {}).get("callees"))
+    return redirectish and bool(excerpt) and has_neighbors
+
+
 def run_system_audit() -> None:
     results: list[bool] = []
 
@@ -86,47 +102,89 @@ def run_system_audit() -> None:
         [
             f"repo: {TEST_PROJECT_ROOT}",
             f"search_queries: {SEARCH_QUERIES}",
-            f"targeted_symbols: {TARGETED_SYMBOLS}",
             f"graph cache: {graph_path}",
         ],
     )
 
-    # --- 1. search_codebase_intent ---
+    # --- 1. search_codebase_intent (json default) ---
     _print_block(
-        "Step 1 — search_codebase_intent",
+        "Step 1 — search_codebase_intent (json)",
         [
-            "Purpose: find candidate node_ids (metadata only, no source code).",
-            f"Input: search_queries={SEARCH_QUERIES}, targeted_symbols={TARGETED_SYMBOLS}",
+            "Purpose: return ranked candidates; top 2 include source_excerpt + neighbor IDs.",
+            f"Input: search_queries={SEARCH_QUERIES}",
         ],
     )
 
-    search_output = search_codebase_intent(
+    search_json = search_codebase_intent(
         search_queries=SEARCH_QUERIES,
         active_project_root=TEST_PROJECT_ROOT,
-        targeted_symbols=TARGETED_SYMBOLS,
+        top_k=8,
+        include_next_action=True,
     )
+    try:
+        parsed = json.loads(search_json)
+        candidates = parsed.get("candidates") or []
+        ok = len(candidates) > 0
+        top = candidates[0] if candidates else {}
+        print(f"  Returned: {len(candidates)} candidate(s)")
+        if top:
+            print(f"    top: {top.get('node_id')} | score={top.get('score')}")
+            print(f"    has source_excerpt: {bool(top.get('source_excerpt'))}")
+            print(f"    neighbors: callers={len(top.get('neighbors', {}).get('callers', []))}, callees={len(top.get('neighbors', {}).get('callees', []))}")
+        results.append(_verdict(ok, "json search returned candidates" if ok else "no candidates"))
+        top_has_excerpt = bool(top.get("source_excerpt"))
+        results.append(_verdict(top_has_excerpt, "top hit includes source_excerpt" if top_has_excerpt else "top hit missing source_excerpt"))
+        top_node = top.get("node_id")
+    except Exception as e:
+        results.append(_verdict(False, f"json parse failed: {e}"))
+        top_node = None
 
-    hits = _parse_search_hits(search_output)
-    print(f"  Returned: {len(hits)} hit(s)")
-    for i, hit in enumerate(hits[:5], 1):
-        print(
-            f"    {i}. {hit['node_id']}"
-            f" | hybrid_score={hit['hybrid_score']}"
-            f" | callers={hit['callers']}"
-            f" | match={hit['match']}"
-        )
-    if len(hits) > 5:
-        print(f"    ... and {len(hits) - 5} more")
-
-    top_node = hits[0]["node_id"] if hits else None
-    results.append(
-        _verdict(
-            len(hits) > 0,
-            "search returned at least one ranked node_id"
-            if hits
-            else "search returned no hits — check graph cache and similarity floor",
-        )
+    # --- 1b. search_codebase_intent (markdown mode) ---
+    _print_block(
+        "Step 1b — search_codebase_intent (markdown mode)",
+        ["Purpose: markdown fallback still returns ranked hits."],
     )
+    search_md = search_codebase_intent(
+        search_queries=SEARCH_QUERIES,
+        active_project_root=TEST_PROJECT_ROOT,
+        format="markdown",
+    )
+    hits = _parse_search_hits(search_md)
+    results.append(_verdict(len(hits) > 0, f"markdown search returned {len(hits)} hit(s)"))
+
+    # --- 1c. redirect-handling regression (1 search should be enough) ---
+    _print_block(
+        "Step 1c — redirect handling regression",
+        [
+            "Purpose: one search answers 'where does redirect handling happen after HTTP response?'",
+            f"Input: search_queries={REDIRECT_SEARCH_QUERIES}",
+        ],
+    )
+    redirect_json = search_codebase_intent(
+        search_queries=REDIRECT_SEARCH_QUERIES,
+        active_project_root=TEST_PROJECT_ROOT,
+        top_k=8,
+    )
+    try:
+        redirect_parsed = json.loads(redirect_json)
+        candidates = redirect_parsed.get("candidates") or []
+        print(f"  Returned: {len(candidates)} candidate(s)")
+        if candidates:
+            for i, c in enumerate(candidates[:3], 1):
+                print(f"    {i}. {c.get('node_id')} | score={c.get('score')}")
+        answerable = _redirect_answerable_from_search(redirect_parsed)
+        top_id = candidates[0].get("node_id", "") if candidates else ""
+        top_is_resolve = REDIRECT_TOP_NODE in top_id or "resolve_redirect" in top_id
+        results.append(
+            _verdict(
+                answerable and top_is_resolve,
+                "redirect question answerable from single search"
+                if answerable and top_is_resolve
+                else f"answerable={answerable}, top={top_id!r}",
+            )
+        )
+    except Exception as e:
+        results.append(_verdict(False, f"redirect json parse failed: {e}"))
 
     # --- 2. calculate_blast_radius ---
     _print_block(
@@ -145,13 +203,6 @@ def run_system_audit() -> None:
     symbol_found = "could not be matched" not in blast_output
 
     print(f"  Returned: {dependent_count} dependent node(s) for symbol {BLAST_RADIUS_SYMBOL!r}")
-    if dependent_count:
-        sample = [ln.strip() for ln in blast_output.splitlines() if ln.startswith("- **[")][:3]
-        for line in sample:
-            print(f"    {line}")
-        if dependent_count > 3:
-            print(f"    ... and {dependent_count - 3} more")
-
     results.append(
         _verdict(
             symbol_found and dependent_count > 0,
@@ -161,74 +212,64 @@ def run_system_audit() -> None:
         )
     )
 
-    # --- 3. trace_callers ---
+    # --- 3. trace_callers (deprecated) ---
     _print_block(
-        "Step 3 — trace_callers",
-        [
-            "Purpose: full caller/callee lists when search/fetch neighbors are not enough.",
-            f"Input: node_id={CALL_GRAPH_NODE!r}",
-        ],
+        "Step 3 — trace_callers (deprecated)",
+        ["Purpose: should return deprecation message pointing to fetch_node_source."],
     )
-
     trace_output = trace_callers(
         node_id=CALL_GRAPH_NODE,
         active_project_root=TEST_PROJECT_ROOT,
+        format="json",
     )
-    has_callers = "**Callers**" in trace_output and "No CALLS edges" not in trace_output
-    has_callees = "**Callees**" in trace_output
-
-    print("  Returned:")
-    for line in trace_output.splitlines():
-        if line.strip():
-            print(f"    {line}")
-
-    results.append(
-        _verdict(
-            has_callers and has_callees,
-            "callers and callees sections present"
-            if has_callers and has_callees
-            else "missing callers or callees in trace output",
-        )
-    )
+    try:
+        trace_parsed = json.loads(trace_output)
+        deprecated = trace_parsed.get("deprecated") is True
+        has_redirect = trace_parsed.get("use_instead", {}).get("tool") == "fetch_node_source"
+        results.append(_verdict(deprecated and has_redirect, "trace_callers returns deprecation redirect"))
+    except Exception as e:
+        results.append(_verdict(False, f"trace json parse failed: {e}"))
 
     # --- 4. fetch_node_source ---
     _print_block(
         "Step 4 — fetch_node_source",
         [
-            "Purpose: return source code plus graph neighbors for one or more node_ids.",
+            "Purpose: capped source excerpt + 1-hop neighbor IDs.",
             f"Input: node_ids=[{CALL_GRAPH_NODE!r}]",
         ],
     )
 
-    fetch_output = fetch_node_source(
+    fetch_json = fetch_node_source(
         node_ids=[CALL_GRAPH_NODE],
         active_project_root=TEST_PROJECT_ROOT,
     )
-    has_source = "RAW SOURCE CONTENT" in fetch_output
-    has_neighbors = "Graph neighbors" in fetch_output
-    line_count = len(fetch_output.splitlines())
-
-    print(f"  Returned: {line_count} lines of text")
-    print(f"    contains source block: {has_source}")
-    print(f"    contains graph neighbors footer: {has_neighbors}")
-
-    results.append(
-        _verdict(
-            has_source and has_neighbors,
-            "source code and graph neighbors both present"
-            if has_source and has_neighbors
-            else "missing source or neighbors in fetch output",
+    try:
+        fetch_parsed = json.loads(fetch_json)
+        nodes = fetch_parsed.get("nodes") or []
+        node = nodes[0] if nodes else {}
+        has_excerpt = bool(node.get("source_excerpt"))
+        neighbors = node.get("neighbors") or {}
+        has_neighbors = bool(neighbors.get("callers") or neighbors.get("callees"))
+        print(f"  Returned: {len(nodes)} node(s)")
+        print(f"    has source_excerpt: {has_excerpt}")
+        print(f"    callers: {len(neighbors.get('callers', []))}, callees: {len(neighbors.get('callees', []))}")
+        results.append(
+            _verdict(
+                has_excerpt and has_neighbors,
+                "fetch returns source_excerpt and neighbor IDs"
+                if has_excerpt and has_neighbors
+                else "missing excerpt or neighbors",
+            )
         )
-    )
+    except Exception as e:
+        results.append(_verdict(False, f"fetch json parse failed: {e}"))
 
-    # --- 5. graph CALLS edges (internal check, not an MCP tool) ---
+    # --- 5. graph CALLS edges (internal check) ---
     _print_block(
         "Step 5 — CALLS edge check (graph validation)",
         [
             "Purpose: confirm redirect flow is wired in the graph backing the MCP tools.",
             f"Node under test: {CALL_GRAPH_NODE}",
-            f"Expect caller containing: {EXPECTED_CALLER_FRAGMENT!r}",
-            f"Expect callee containing: {EXPECTED_CALLEE_FRAGMENT!r}",
         ],
     )
 
@@ -241,7 +282,7 @@ def run_system_audit() -> None:
 
         callers, callees = get_call_neighbors(G, CALL_GRAPH_NODE)
         print(f"  Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-        print(f"  Callers ({len(callers)}): {callers}")
+        print(f"  Callers ({len(callers)}): {callers[:3]}{'...' if len(callers) > 3 else ''}")
         print(f"  Callees ({len(callees)}): {callees[:5]}{'...' if len(callees) > 5 else ''}")
 
         caller_ok = any(EXPECTED_CALLER_FRAGMENT in c for c in callers)
