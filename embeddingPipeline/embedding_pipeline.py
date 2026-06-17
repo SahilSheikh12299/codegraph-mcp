@@ -2,13 +2,16 @@ import json
 from pathlib import Path
 import networkx as nx
 from typing import List, Dict, Any
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import sys
 import torch
 import threading
 import os
 import contextlib
 import gc
+
+
+RERANKER_MODEL_NAME = "mixedbread-ai/mxbai-rerank-base-v2"
 
 
 class LocalEmbeddingPipeline:
@@ -61,6 +64,7 @@ class EmbeddingModelLifecycleManager:
     """Thread-safe on-demand lifecycle manager for heavy deep learning models."""
     def __init__(self):
         self.model = None
+        self.reranker = None
         self.active_tasks = 0
         self.lock = threading.Lock()
 
@@ -84,12 +88,30 @@ class EmbeddingModelLifecycleManager:
             self.active_tasks += 1
             return self.model
 
+    def acquire_reranker(self) -> CrossEncoder:
+        """Lazy-load cross-encoder for search reranking."""
+        with self.lock:
+            if self.reranker is None:
+                old_stdout = sys.stdout
+                sys.stdout = sys.stderr
+                try:
+                    with open(os.devnull, "w") as fnull:
+                        with contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
+                            self.reranker = CrossEncoder(RERANKER_MODEL_NAME)
+                except Exception as e:
+                    print(f"[CRITICAL FAIL] Reranker load crashed: {e}", file=sys.stderr)
+                    raise e
+                finally:
+                    sys.stdout = old_stdout
+            return self.reranker
+
     def release(self):
         """Reduces usage reference. Completely offloads model if no jobs remain."""
         with self.lock:
             self.active_tasks -= 1
             if self.active_tasks <= 0:
                 self.model = None
+                self.reranker = None
                 self.active_tasks = 0
                 gc.collect()
                 try:

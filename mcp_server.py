@@ -24,7 +24,7 @@ from embeddingPipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipe
 from advanced_engine import (
     AdvancedRetrievalEngine,
     extract_source_excerpt,
-    format_call_neighbors,
+    # format_call_neighbors,
     get_call_neighbors,
     recompute_call_centrality,
     NEIGHBOR_ID_LIMIT,
@@ -71,39 +71,39 @@ def _find_impl_alternate(G: nx.DiGraph, node_id: str, node_data: dict) -> str | 
     return best_id if best_id and best_id != node_id else None
 
 
-def _graph_neighbors_footer(G: nx.DiGraph, node_id: str) -> str:
-    neighbors = format_call_neighbors(G, node_id)
-    if not neighbors:
-        return ""
-    return f"\n\n### Graph neighbors\n{neighbors}"
+# def _graph_neighbors_footer(G: nx.DiGraph, node_id: str) -> str:
+#     neighbors = format_call_neighbors(G, node_id)
+#     if not neighbors:
+#         return ""
+#     return f"\n\n### Graph neighbors\n{neighbors}"
 
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-def _get_capped_call_neighbors(G: nx.DiGraph, node_id: str, neighbors_max: int) -> dict:
-    """Return callers/callees node_ids capped to neighbors_max with *_more counts."""
-    if not G.has_node(node_id):
-        return {"callers": [], "callees": [], "callers_more": 0, "callees_more": 0}
+# def _get_capped_call_neighbors(G: nx.DiGraph, node_id: str, neighbors_max: int) -> dict:
+#     """Return callers/callees node_ids capped to neighbors_max with *_more counts."""
+#     if not G.has_node(node_id):
+#         return {"callers": [], "callees": [], "callers_more": 0, "callees_more": 0}
 
-    callers_all = sorted(
-        p for p in G.predecessors(node_id) if G.edges[p, node_id].get("relationship") == "CALLS"
-    )
-    callees_all = sorted(
-        s for s in G.successors(node_id) if G.edges[node_id, s].get("relationship") == "CALLS"
-    )
+#     callers_all = sorted(
+#         p for p in G.predecessors(node_id) if G.edges[p, node_id].get("relationship") == "CALLS"
+#     )
+#     callees_all = sorted(
+#         s for s in G.successors(node_id) if G.edges[node_id, s].get("relationship") == "CALLS"
+#     )
 
-    callers = callers_all[: max(0, neighbors_max)]
-    callees = callees_all[: max(0, neighbors_max)]
-    return {
-        "callers": callers,
-        "callees": callees,
-        "callers_more": max(0, len(callers_all) - len(callers)),
-        "callees_more": max(0, len(callees_all) - len(callees)),
-        "callers_count": len(callers_all),
-        "callees_count": len(callees_all),
-    }
+#     callers = callers_all[: max(0, neighbors_max)]
+#     callees = callees_all[: max(0, neighbors_max)]
+#     return {
+#         "callers": callers,
+#         "callees": callees,
+#         "callers_more": max(0, len(callers_all) - len(callers)),
+#         "callees_more": max(0, len(callees_all) - len(callees)),
+#         "callers_count": len(callers_all),
+#         "callees_count": len(callees_all),
+#     }
 
 
 def _render_neighbors_markdown(neighbors: dict) -> str:
@@ -123,53 +123,53 @@ def _render_neighbors_markdown(neighbors: dict) -> str:
     return "\n".join(lines)
 
 
-def _extract_docstring(source: str) -> str | None:
-    # Best-effort: first triple-quoted literal after signature.
-    m = re.search(r'^[ \t]*(?:"""|\'\'\')([\s\S]*?)(?:"""|\'\'\')', source, re.MULTILINE)
-    if not m:
-        return None
-    return m.group(1).strip()
+# def _extract_docstring(source: str) -> str | None:
+#     # Best-effort: first triple-quoted literal after signature.
+#     m = re.search(r'^[ \t]*(?:"""|\'\'\')([\s\S]*?)(?:"""|\'\'\')', source, re.MULTILINE)
+#     if not m:
+#         return None
+#     return m.group(1).strip()
 
 
-def _slice_source(source: str, slices: list[str]) -> dict:
-    lines = source.splitlines()
-    out: dict[str, Any] = {}
+# def _slice_source(source: str, slices: list[str]) -> dict:
+#     lines = source.splitlines()
+#     out: dict[str, Any] = {}
 
-    if "signature" in slices:
-        sig_lines: list[str] = []
-        for ln in lines[:25]:
-            if ln.lstrip().startswith(("def ", "async def ", "class ")):
-                sig_lines.append(ln)
-                break
-        out["signature_lines"] = sig_lines
+#     if "signature" in slices:
+#         sig_lines: list[str] = []
+#         for ln in lines[:25]:
+#             if ln.lstrip().startswith(("def ", "async def ", "class ")):
+#                 sig_lines.append(ln)
+#                 break
+#         out["signature_lines"] = sig_lines
 
-    if "docstring" in slices:
-        out["docstring"] = _extract_docstring(source)
+#     if "docstring" in slices:
+#         out["docstring"] = _extract_docstring(source)
 
-    if "args" in slices:
-        # Minimal: include the signature line only (arguments are inside it).
-        out["args_hint"] = "See signature_lines"
+#     if "args" in slices:
+#         # Minimal: include the signature line only (arguments are inside it).
+#         out["args_hint"] = "See signature_lines"
 
-    def _cap_matches(prefixes: tuple[str, ...], cap: int = 12) -> list[str]:
-        matches = []
-        for ln in lines:
-            s = ln.lstrip()
-            if s.startswith(prefixes):
-                matches.append(ln)
-                if len(matches) >= cap:
-                    break
-        return matches
+#     def _cap_matches(prefixes: tuple[str, ...], cap: int = 12) -> list[str]:
+#         matches = []
+#         for ln in lines:
+#             s = ln.lstrip()
+#             if s.startswith(prefixes):
+#                 matches.append(ln)
+#                 if len(matches) >= cap:
+#                     break
+#         return matches
 
-    if "returns" in slices:
-        out["return_lines"] = _cap_matches(("return ",))
-    if "raises" in slices:
-        out["raise_lines"] = _cap_matches(("raise ",))
-    if "ifs" in slices:
-        out["if_lines"] = _cap_matches(("if ", "elif ", "else:"))
-    if "loops" in slices:
-        out["loop_lines"] = _cap_matches(("for ", "while "))
+#     if "returns" in slices:
+#         out["return_lines"] = _cap_matches(("return ",))
+#     if "raises" in slices:
+#         out["raise_lines"] = _cap_matches(("raise ",))
+#     if "ifs" in slices:
+#         out["if_lines"] = _cap_matches(("if ", "elif ", "else:"))
+#     if "loops" in slices:
+#         out["loop_lines"] = _cap_matches(("for ", "while "))
 
-    return out
+#     return out
 
 
 def get_graph_paths(active_project_root: str | Path) -> Tuple[Path, Path]:
@@ -413,7 +413,7 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
 def search_codebase_intent(
     search_queries: list[str],
     active_project_root: str,
-    targeted_symbols: list[str] = None,
+    # targeted_symbols: list[str] = None,
     top_k: int = 8,
     format: str = "json",
     include_next_action: bool = True,
@@ -422,8 +422,7 @@ def search_codebase_intent(
 
     Args:
         search_queries: Keyword-dense strings, e.g. ["redirect Location 301", "resolve_redirects"].
-        active_project_root: Absolute path to the repo root.
-        targeted_symbols: Deprecated — ignored. Put identifiers in search_queries instead.
+        active_project_root: Absolute path to the repo root.        
         top_k: Max candidates to return (top 2 include source_excerpt).
         format: "json" (default) or "markdown".
         include_next_action: If true, suggest fetch_node_source for the top hit.
@@ -432,13 +431,18 @@ def search_codebase_intent(
     graph_path, lock_path = get_graph_paths(workspace_root)
 
     embedder = model_manager.acquire()
+    reranker = model_manager.acquire_reranker()
     try:
         with FileLock(lock_path):
             G = GraphSerializer.load_from_json(workspace_root, graph_path)
             if execute_preflight_lazy_sync(workspace_root, G, embedder):
                 GraphSerializer.save_to_json(G, workspace_root, graph_path)
 
-        engine = AdvancedRetrievalEngine(graph_instance=G, embedder_instance=embedder)
+        engine = AdvancedRetrievalEngine(
+            graph_instance=G,
+            embedder_instance=embedder,
+            reranker=reranker,
+        )
         return engine.compile_context_package(
             search_queries=search_queries,
             top_k=top_k,
@@ -570,10 +574,10 @@ def _format_node_source(
     G: nx.DiGraph,
     node_id: str,
     *,
-    mode: str = "excerpt",
-    slices: list[str] | None = None,
-    max_lines: int = SOURCE_EXCERPT_MAX_LINES,
-    include_neighbors: bool = True,
+    # mode: str = "excerpt",
+    # slices: list[str] | None = None,
+    # max_lines: int = SOURCE_EXCERPT_MAX_LINES,
+    # include_neighbors: bool = True,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
     format: str = "json",
 ) -> str:
@@ -597,10 +601,10 @@ def _format_node_source(
 def fetch_node_source(
     node_ids: list[str],
     active_project_root: str,
-    mode: str = "excerpt",
-    slices: list[str] | None = None,
-    max_lines: int = SOURCE_EXCERPT_MAX_LINES,
-    include_neighbors: bool = True,
+    # mode: str = "excerpt",
+    # slices: list[str] | None = None,
+    # max_lines: int = SOURCE_EXCERPT_MAX_LINES,
+    # include_neighbors: bool = True,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
     format: str = "json",
 ) -> str:
@@ -644,9 +648,9 @@ def fetch_node_source(
 @mcp.tool()
 def trace_callers(
     node_id: str,
-    active_project_root: str,
+    # active_project_root: str,
     format: str = "json",
-    max_items: int = 50,
+    # max_items: int = 50,
 ) -> str:
     """Deprecated. Use fetch_node_source — it includes 1-hop callers and callees."""
     msg = {

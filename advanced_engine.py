@@ -11,9 +11,11 @@ import json
 import re
 
 SEARCH_RESULT_LIMIT = 6
-SEMANTIC_WEIGHT = 0.6
-GRAPH_WEIGHT = 0.3
-KEYWORD_WEIGHT = 0.1
+SEMANTIC_POOL_SIZE = 50
+STAGE1_POOL_SIZE = 20
+STAGE1_SEMANTIC_WEIGHT = 0.7
+STAGE1_KEYWORD_WEIGHT = 0.3
+RERANK_PASSAGE_MAX_LINES = 40
 SOURCE_EXCERPT_MAX_LINES = 100
 NEIGHBOR_ID_LIMIT = 50
 
@@ -26,6 +28,7 @@ _STOPWORDS = frozenset({
 
 def extract_keywords_from_queries(search_queries: List[str]) -> List[str]:
     """Loose keyword tokens from all search queries (no exact-symbol mode)."""
+    # TODO: Add more advanced keyword extraction logic here. Use spacy for better keyword extraction.
     keywords: set[str] = set()
     for query in search_queries:
         for token in re.findall(r"[a-zA-Z0-9_]+", query.lower()):
@@ -90,6 +93,19 @@ def extract_source_excerpt(
     return "\n".join(parts)
 
 
+def build_rerank_passage(data: Dict[str, Any]) -> str:
+    """Metadata + capped source body for cross-encoder reranking."""
+    meta = (data.get("embedding_text") or "").strip()
+    body = extract_source_excerpt(
+        data.get("chunk_text", ""),
+        data.get("type", "FUNCTION"),
+        max_lines=RERANK_PASSAGE_MAX_LINES,
+    )
+    if meta and body:
+        return f"{meta}\n\n{body}"
+    return meta or body
+
+
 def get_call_neighbors(G: nx.DiGraph, node_id: str, limit: int = 5) -> Tuple[List[str], List[str]]:
     """Return 1-hop CALLS predecessors (callers) and successors (callees)."""
     if not G.has_node(node_id):
@@ -136,12 +152,18 @@ class AdvancedRetrievalEngine:
     mathematical cliff-detection re-ranking, and recursive upstream blast-radius mappings.
     """
 
-    def __init__(self, graph_instance: nx.DiGraph, embedder_instance: Any):
+    def __init__(
+        self,
+        graph_instance: nx.DiGraph,
+        embedder_instance: Any,
+        reranker: Any = None,
+    ):
         """Initializes the engine with a living instance of the codebase graph
         and an offline-locked embedding module from the server pool.
         """
         self.G = graph_instance
         self.embedder = embedder_instance
+        self.reranker = reranker
 
     def _extract_tiny_slice(self, chunk_text: str, max_lines: int = 8) -> str:
         """Returns signature + first lines of actual body logic (skips docstring/comments)."""
@@ -205,43 +227,76 @@ class AdvancedRetrievalEngine:
 
     def run_hybrid_retrieval(
         self,
-        query_text: str,
+        search_queries: List[str],
         keywords: List[str] | None = None,
     ) -> List[Dict[str, Any]]:
-        """Semantic vector pool (top 20) reranked with keyword presence + call centrality."""
-        scored_hits = []
+        """Two-stage retrieval: semantic top 50 → keyword blend top 20 → cross-encoder top 6."""
         keyword_list = keywords or []
+        queries = [q.strip() for q in search_queries if q and q.strip()]
+        if not queries:
+            return []
 
-        query_vector = self.embedder.model.encode(query_text, convert_to_numpy=True).tolist()
+        query_vectors = self.embedder.model.encode(queries, convert_to_numpy=True)
+        if query_vectors.ndim == 1:
+            query_vectors = query_vectors.reshape(1, -1)
 
+        scored_hits: list[tuple[str, Dict[str, Any], float]] = []
         for node_id, data in self.G.nodes(data=True):
             if "type" not in data:
                 continue
 
             node_vector = data.get("embedding")
             if not node_vector or len(node_vector) == 0:
-                confidence = 0.0
-            else:
-                confidence = self._calculate_cosine_similarity(query_vector, node_vector)
+                continue
 
-            if confidence > 0.0:
-                scored_hits.append((node_id, data, confidence))
+            max_sim = max(
+                self._calculate_cosine_similarity(qv.tolist(), node_vector)
+                for qv in query_vectors
+            )
+            if max_sim > 0.0:
+                scored_hits.append((node_id, data, max_sim))
 
         scored_hits.sort(key=lambda x: x[2], reverse=True)
-        candidates = [h for h in scored_hits if h[2] >= 0.35][:20]
+        semantic_pool = scored_hits[:SEMANTIC_POOL_SIZE]
 
-        reranked = []
-        for node_id, data, sim in candidates:
+        stage1: list[tuple[str, Dict[str, Any], float, float, float]] = []
+        for node_id, data, sim in semantic_pool:
             kw_score = compute_keyword_score(data, keyword_list)
-            final = (
-                SEMANTIC_WEIGHT * sim
-                + GRAPH_WEIGHT * data.get("call_centrality", 0.0)
-                + KEYWORD_WEIGHT * kw_score
-            )
-            reranked.append((node_id, data, final, kw_score))
+            prelim = STAGE1_SEMANTIC_WEIGHT * sim + STAGE1_KEYWORD_WEIGHT * kw_score
+            stage1.append((node_id, data, prelim, kw_score, sim))
 
-        reranked.sort(key=lambda x: x[2], reverse=True)
-        final_selections = reranked[:SEARCH_RESULT_LIMIT]
+        stage1.sort(key=lambda x: x[2], reverse=True)
+        stage1_pool = stage1[:STAGE1_POOL_SIZE]
+
+        if self.reranker and stage1_pool:
+            pairs: list[list[str]] = []
+            pair_node_ids: list[str] = []
+            for node_id, data, _, _, _ in stage1_pool:
+                passage = build_rerank_passage(data)
+                for query in queries:
+                    pairs.append([query, passage])
+                    pair_node_ids.append(node_id)
+
+            ce_scores = self.reranker.predict(pairs, batch_size=16)
+            node_meta = {nid: (data, kw) for nid, data, _, kw, _ in stage1_pool}
+            node_max_scores: dict[str, float] = {}
+            for node_id, score in zip(pair_node_ids, ce_scores):
+                score_f = float(score)
+                if node_id not in node_max_scores or score_f > node_max_scores[node_id]:
+                    node_max_scores[node_id] = score_f
+
+            final_reranked = [
+                (nid, node_meta[nid][0], node_max_scores[nid], node_meta[nid][1])
+                for nid in node_max_scores
+            ]
+            final_reranked.sort(key=lambda x: x[2], reverse=True)
+        else:
+            final_reranked = [
+                (node_id, data, prelim, kw_score)
+                for node_id, data, prelim, kw_score, _ in stage1_pool
+            ]
+
+        final_selections = final_reranked[:SEARCH_RESULT_LIMIT]
 
         return [
             {
@@ -283,33 +338,16 @@ class AdvancedRetrievalEngine:
     def compile_context_package(
         self,
         search_queries: List[str],
-        targeted_symbols: List[str] = None,
+        # targeted_symbols: List[str] = None,
         top_k: int | None = None,
         output_format: str = "json",
         include_next_action: bool = True,
     ) -> str:
         """Multi-query hybrid retrieval. Top 2 hits include capped source_excerpt + neighbor IDs."""
-        global_seeds_pool: Dict[str, Dict[str, Any]] = {}
         keywords = extract_keywords_from_queries(search_queries)
+        query_hits = self.run_hybrid_retrieval(search_queries, keywords=keywords)
 
-        for query in search_queries:
-            query = query.strip()
-            if not query:
-                continue
-
-            query_hits = self.run_hybrid_retrieval(query, keywords=keywords)
-            if not query_hits:
-                continue
-
-            for hit in query_hits:
-                node_id = hit["node_id"]
-                if node_id in global_seeds_pool:
-                    if hit["hybrid_score"] > global_seeds_pool[node_id]["hybrid_score"]:
-                        global_seeds_pool[node_id] = hit
-                else:
-                    global_seeds_pool[node_id] = hit
-
-        if not global_seeds_pool:
+        if not query_hits:
             if output_format == "json":
                 return json.dumps(
                     {"queries": search_queries, "candidates": [], "message": "No matches found."},
@@ -318,10 +356,8 @@ class AdvancedRetrievalEngine:
                 )
             return "### [Graph-RAG System Message]\nNo relevant structural context matched this query matrix."
 
-        unified_candidates = list(global_seeds_pool.values())
-        unified_candidates.sort(key=lambda x: x["hybrid_score"], reverse=True)
         limit = SEARCH_RESULT_LIMIT if top_k is None else max(1, int(top_k))
-        final_seeds = unified_candidates[:limit]
+        final_seeds = query_hits[:limit]
 
         def _json_dumps(obj: Any) -> str:
             return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -368,7 +404,8 @@ class AdvancedRetrievalEngine:
         markdown += f"Queries: {', '.join(search_queries)}\n"
         markdown += (
             f"Showing top {len(final_seeds)} matches. "
-            f"Score = {SEMANTIC_WEIGHT}×semantic + {GRAPH_WEIGHT}×centrality + {KEYWORD_WEIGHT}×keywords.\n\n"
+            f"Stage 1: {STAGE1_SEMANTIC_WEIGHT}×semantic + {STAGE1_KEYWORD_WEIGHT}×keywords (top {STAGE1_POOL_SIZE}); "
+            f"Stage 2: cross-encoder rerank.\n\n"
         )
 
         for idx, hit in enumerate(final_seeds, 1):
