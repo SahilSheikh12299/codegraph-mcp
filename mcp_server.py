@@ -23,14 +23,11 @@ from graph_io import GraphSerializer
 from embeddingPipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
 from advanced_engine import (
     AdvancedRetrievalEngine,
-    extract_source_excerpt,
-    # format_call_neighbors,
     get_call_neighbors,
     recompute_call_centrality,
     build_grep_text,
     grep_search_nodes,
     NEIGHBOR_ID_LIMIT,
-    SOURCE_EXCERPT_MAX_LINES,
 )
 from buildGraph import (
     wire_calls_for_file,
@@ -648,7 +645,7 @@ def _build_node_payload(
     *,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
 ) -> dict[str, Any]:
-    """Single node: capped source_excerpt + 1-hop neighbor IDs."""
+    """Single node: full source + 1-hop neighbor IDs."""
     if not G.has_node(node_id):
         return {"node_id": node_id, "error": f"Node ID '{node_id}' not found."}
 
@@ -673,7 +670,7 @@ def _build_node_payload(
         "file_path": node_data.get("file_path"),
         "name": node_data.get("name"),
         "signature": node_data.get("signature", ""),
-        "source_excerpt": extract_source_excerpt(chunk_text, node_type, SOURCE_EXCERPT_MAX_LINES),
+        "source": (chunk_text or "").strip(),
         "neighbors": neighbors,
     }
 
@@ -699,14 +696,10 @@ def _format_node_source(
     G: nx.DiGraph,
     node_id: str,
     *,
-    # mode: str = "excerpt",
-    # slices: list[str] | None = None,
-    # max_lines: int = SOURCE_EXCERPT_MAX_LINES,
-    # include_neighbors: bool = True,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
     format: str = "json",
 ) -> str:
-    """Backward-compatible wrapper; always returns capped excerpt + neighbor IDs."""
+    """Returns full source + neighbor IDs."""
     payload = _build_node_payload(G, node_id, neighbors_max=neighbors_max)
     if format == "json":
         return _json_dumps(payload)
@@ -714,7 +707,7 @@ def _format_node_source(
     if payload.get("error"):
         return f"### [Graph-RAG System Message]\n{payload['error']}"
 
-    body = f"### Source for `{payload['node_id']}`\n\n```python\n{payload.get('source_excerpt', '')}\n```"
+    body = f"### Source for `{payload['node_id']}`\n\n```python\n{payload.get('source', '')}\n```"
     neighbors = payload.get("neighbors") or {}
     rendered = _render_neighbors_markdown(neighbors)
     if rendered:
@@ -726,18 +719,18 @@ def _format_node_source(
 def fetch_node_source(
     node_ids: list[str],
     active_project_root: str,
-    # mode: str = "excerpt",
-    # slices: list[str] | None = None,
-    # max_lines: int = SOURCE_EXCERPT_MAX_LINES,
-    # include_neighbors: bool = True,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
     format: str = "json",
 ) -> str:
-    """Capped source excerpt + 1-hop neighbor IDs for one or more node_ids.
+    """Full AST-bound source + 1-hop neighbor IDs for one or more node_ids.
+
+    Neighbors are always included.
 
     Args:
         node_ids: Exact node_id(s) from search output neighbors or candidates.
         active_project_root: Absolute path to the repo root.
+        neighbors_max: Max caller/callee node_ids per node (default 50).
+        format: "json" (default) or "markdown".
     """
     workspace_root = Path(active_project_root).resolve()
     graph_path, lock_path = get_graph_paths(workspace_root)

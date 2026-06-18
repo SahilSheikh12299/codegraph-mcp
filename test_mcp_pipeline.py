@@ -295,7 +295,7 @@ def run_system_audit() -> None:
     _print_block(
         "Step 4 — fetch_node_source",
         [
-            "Purpose: capped source excerpt + 1-hop neighbor IDs.",
+            "Purpose: full AST-bound source + 1-hop neighbor IDs.",
             f"Input: node_ids=[{CALL_GRAPH_NODE!r}]",
         ],
     )
@@ -308,18 +308,18 @@ def run_system_audit() -> None:
         fetch_parsed = json.loads(fetch_json)
         nodes = fetch_parsed.get("nodes") or []
         node = nodes[0] if nodes else {}
-        has_excerpt = bool(node.get("source_excerpt"))
+        has_source = bool(node.get("source"))
         neighbors = node.get("neighbors") or {}
         has_neighbors = bool(neighbors.get("callers") or neighbors.get("callees"))
         print(f"  Returned: {len(nodes)} node(s)")
-        print(f"    has source_excerpt: {has_excerpt}")
+        print(f"    has source: {has_source}")
         print(f"    callers: {len(neighbors.get('callers', []))}, callees: {len(neighbors.get('callees', []))}")
         results.append(
             _verdict(
-                has_excerpt and has_neighbors,
-                "fetch returns source_excerpt and neighbor IDs"
-                if has_excerpt and has_neighbors
-                else "missing excerpt or neighbors",
+                has_source and has_neighbors,
+                "fetch returns full source and neighbor IDs"
+                if has_source and has_neighbors
+                else "missing source or neighbors",
             )
         )
     except Exception as e:

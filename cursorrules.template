@@ -96,13 +96,19 @@ Use when you only need symbol lookup without semantic search, or as a follow-up 
 
 ### 3. `fetch_node_source` — **dig deeper**
 
-Fetches capped source for specific `node_id`s. Use only when you truly need code lines (implementation detail, exact behavior).
+Fetches **full** AST-bound source for specific `node_id`s. Use when you need implementation detail or exact behavior.
 
 **Required args:**
 - `node_ids` — list of exact IDs from `semantic_bucket`, `grep_buckets`, or `neighbors`
 - `active_project_root` — absolute repo root path
 
-**Returns:** `source_excerpt` (max ~100 lines) + neighbor IDs per node.
+**Optional args:**
+- `neighbors_max` — max caller/callee IDs per node (default `50`)
+- `format="json"`
+
+**Not supported (do not pass):** `max_lines`, `include_neighbors`, `mode`, `slices`.
+
+**Returns:** `source` (full function/class body from the graph) + neighbor IDs per node.
 
 **Critical batching rule:** collect ALL `node_id`s you might need (top hits + relevant callers/callees) and call `fetch_node_source` **once** with a single combined list. Do not call `fetch_node_source` twice for the same question unless the first call returned `error`.
 
@@ -211,4 +217,5 @@ Bad:
 - **Do not use native Grep/Read/SemanticSearch** — use `grep_terms` in search or `grep_graph_nodes` and `fetch_node_source`.
 - **Do not use `trace_callers`** or `targeted_symbols`.
 - **Batch** `fetch_node_source` — pass all needed `node_ids` in one request (do not call it twice).
-- Answer from `embedding_text` + neighbors when enough; fetch source only when needed.
+- **Do not pass** `max_lines`, `include_neighbors`, `mode`, or `slices` to `fetch_node_source` — they are not tool parameters.
+- Answer from `embedding_text` + neighbors when enough; fetch full `source` only when needed.
