@@ -1,6 +1,7 @@
 # GraphRAG — Code Discovery Rules
 
-Use the GraphRAG MCP server **before** Read, Grep, or SemanticSearch when locating or understanding code.
+## Goal (read this first)
+Your objective is to answer repo questions with **minimum tokens and minimum tool calls** by using GraphRAG tools. Avoid native Cursor Grep/Read unless GraphRAG cannot satisfy the request.
 
 Always pass `active_project_root` as the **absolute path** to the repo root.
 
@@ -8,85 +9,106 @@ Always pass `active_project_root` as the **absolute path** to the repo root.
 
 ## Tools (what each one does)
 
-### 1. `search_codebase_intent` — **start here**
+### 1. `search_codebase_intent` — **start here (preferred)**
 
-Finds code by meaning + keywords. **Call this once per question.**
+Finds code by meaning **and** literal symbol names in one call. **Call this once per question** and try to answer from its output.
 
 **Required args:**
-- `search_queries` — list of short, keyword-dense strings (see below)
+- `search_queries` — LLM-rewritten, keyword-dense intent strings (see below)
 - `active_project_root` — absolute repo root path
 
-**Optional args (defaults are fine):**
-- `top_k=8` — max candidates returned
+**Strongly recommended:**
+- `grep_terms` — list of **exact strings** you would otherwise pass to Grep (function names, class names, config keys). Example: `["Session", "resolve_redirects"]`
+
+When `grep_terms` is provided, the server returns **bucketed** results (no source code — use `fetch_node_source` to dig deeper).
+
+**Optional args:**
 - `format="json"` — always use JSON
 - `include_next_action=True`
 
-**Do NOT use:** `targeted_symbols` — deprecated and ignored. Put function/class names inside `search_queries` instead.
+**Do NOT use:** `targeted_symbols` — deprecated and ignored.
 
-**Returns (JSON):**
+**Returns with `grep_terms` (bucketed JSON):**
 ```json
 {
-  "queries": ["..."],
-  "keywords": ["..."],
-  "candidates": [
-    {
-      "node_id": "src/foo.py::Class.method",
-      "type": "FUNCTION",
-      "file_path": "src/foo.py",
-      "name": "method",
-      "signature": "(self, ...)",
-      "score": 0.82,
-      "source_excerpt": "... capped code (top 2 only) ...",
-      "neighbors": {
-        "callers": ["src/foo.py::Other.method"],
-        "callees": ["src/bar.py::helper"]
+  "rewritten_queries": ["HTTP redirect Location header 301"],
+  "grep_terms": ["Session", "resolve_redirects"],
+  "semantic_bucket": {
+    "nodes": [
+      {
+        "node_id": "src/foo.py::Class.method",
+        "type": "FUNCTION",
+        "file_path": "src/foo.py",
+        "name": "method",
+        "signature": "(self, ...)",
+        "embedding_text": "Type: FUNCTION\nName: method\n...",
+        "score": 0.82,
+        "neighbors": {
+          "callers": ["src/foo.py::Other.method"],
+          "callees": ["src/bar.py::helper"]
+        }
       }
+    ]
+  },
+  "grep_buckets": [
+    {
+      "term": "Session",
+      "match_mode": "exact",
+      "nodes": [
+        {
+          "node_id": "src/sessions.py::Session",
+          "signature": "()",
+          "embedding_text": "...",
+          "match_mode": "exact",
+          "neighbors": { "callers": ["..."], "callees": ["..."] }
+        }
+      ]
     }
   ],
   "next_action": { "tool": "fetch_node_source", "args": { "node_ids": ["..."] } }
 }
 ```
 
-- **Top 2** candidates include `source_excerpt` (max ~100 lines + return line if truncated).
-- **All** candidates include `neighbors` (direct caller/callee `node_id`s only — no source).
-- Candidates ranked 3+ have metadata only (no `source_excerpt`).
+- **semantic_bucket**: top **3** nodes from rewritten queries (embedding + rerank). No `source_excerpt`.
+- **grep_buckets**: one bucket per `grep_term`. **Exact match → top 1**; **fuzzy → top 3**.
+- Each node includes `embedding_text` + up to **5 callers / 5 callees** (IDs only).
+- **No source code** in bucketed mode — call `fetch_node_source` when you need code.
+
+**Legacy mode (no `grep_terms`):** returns flat `candidates` with `source_excerpt` on top 2 hits. Prefer bucketed mode for new questions.
 
 ---
 
-### 2. `fetch_node_source` — **dig deeper (optional)**
+### 2. `grep_graph_nodes` — **use instead of native Grep**
 
-Fetches capped source for specific `node_id`s. Use when search excerpts are not enough.
+Exact-string search over graph node metadata (names, signatures, paths). **Do not use Cursor Grep** when this tool is available.
 
 **Required args:**
-- `node_ids` — list of exact IDs from `candidates[].node_id` or `candidates[].neighbors`
+- `terms` — literal strings (same as what you would grep for)
 - `active_project_root` — absolute repo root path
 
-**Optional args:** defaults are fine. `format="json"` is default.
+**Optional:** `case_sensitive=false`, `max_hits_per_term=3`, `format="json"`
 
-**Do NOT pass:** `mode`, `slices`, `include_neighbors` — these are legacy and ignored. Behavior is always the same.
+**Returns:** per-term buckets with `match_mode` (`exact` | `fuzzy` | `none`), nodes with `embedding_text` + neighbors. Exact hit → 1 node; fuzzy → up to 3.
 
-**Returns (JSON):**
-```json
-{
-  "nodes": [
-    {
-      "node_id": "src/foo.py::Class.method",
-      "type": "FUNCTION",
-      "file_path": "src/foo.py",
-      "name": "method",
-      "signature": "(self, ...)",
-      "source_excerpt": "... capped code ...",
-      "neighbors": { "callers": ["..."], "callees": ["..."] }
-    }
-  ]
-}
-```
-
-Pass **multiple** `node_ids` in one call when following neighbors (batch fetch).
+Use when you only need symbol lookup without semantic search, or as a follow-up after bucketed search.
 
 ---
 
-### 3. `calculate_blast_radius` — **only before editing code**
+### 3. `fetch_node_source` — **dig deeper**
+
+Fetches capped source for specific `node_id`s. Use only when you truly need code lines (implementation detail, exact behavior).
+
+**Required args:**
+- `node_ids` — list of exact IDs from `semantic_bucket`, `grep_buckets`, or `neighbors`
+- `active_project_root` — absolute repo root path
+
+**Returns:** `source_excerpt` (max ~100 lines) + neighbor IDs per node.
+
+**Critical batching rule:** collect ALL `node_id`s you might need (top hits + relevant callers/callees) and call `fetch_node_source` **once** with a single combined list. Do not call `fetch_node_source` twice for the same question unless the first call returned `error`.
+
+---
+
+### 4. `calculate_blast_radius` — **only before editing code**
 
 Lists upstream code that would break if you change a symbol. **Not for discovery.**
 
@@ -94,13 +116,11 @@ Lists upstream code that would break if you change a symbol. **Not for discovery
 - `target_symbol` — bare name, e.g. `"resolve_redirects"` or `"Session.request"`
 - `active_project_root` — absolute repo root path
 
-**Optional:** `format="json"`, `max_items=50`
-
 ---
 
-### 4. `trace_callers` — **deprecated, do not use**
+### 5. `trace_callers` — **deprecated, do not use**
 
-Returns a deprecation message. Neighbors are already in search/fetch output. Use `fetch_node_source` instead.
+Use `fetch_node_source` — neighbors are already included in search/grep output.
 
 ---
 
@@ -108,63 +128,77 @@ Returns a deprecation message. Neighbors are already in search/fetch output. Use
 
 For every “where / how does X work?” question:
 
-1. **Search once** — single `search_codebase_intent` call.
-   - Put **all** keywords and symbol names in `search_queries` (multiple strings OK).
-   - Example for redirect handling:
-     ```json
-     {
-       "search_queries": [
-         "HTTP redirect response Location header 301 302",
-         "resolve_redirects allow_redirects",
-         "is_redirect status code"
-       ],
-       "active_project_root": "/absolute/path/to/repo"
-     }
-     ```
+1. **Prepare inputs before calling the server:**
+   - `search_queries` — rewrite the user question into 1–3 short, keyword-dense strings (no filler).
+   - `grep_terms` — extract **exact symbols/strings** the user mentioned or that you would grep for (class names, function names, constants).
 
-2. **Read the response** — top 2 hits already include `source_excerpt` + `neighbors`.
-   - Prefer higher `score`.
-   - For flow questions, prefer nodes with more `neighbors.callers` (entry-point-ish).
-   - Prefer the **method** over its parent **class** when both appear.
+2. **Search once** — single `search_codebase_intent` call with both:
+   ```json
+   {
+     "search_queries": [
+       "HTTP redirect response Location header 301 302",
+       "resolve_redirects allow_redirects follow redirect chain"
+     ],
+     "grep_terms": ["Session", "resolve_redirects", "is_redirect"],
+     "active_project_root": "/absolute/path/to/repo"
+   }
+   ```
 
-3. **Fetch only if needed** — one `fetch_node_source` call with relevant `node_ids` from `neighbors`.
-   - Batch multiple IDs in a single call.
+3. **Read bucketed response (do not fetch yet):**
+   - Use `semantic_bucket` for intent / flow questions.
+   - Use `grep_buckets` for exact symbol location and certainty.
+   - Follow `neighbors.callers` / `neighbors.callees` to understand flow (IDs only).
+
+4. **Fetch only if needed (at most once)**:
+   - Build a single `node_ids` list that includes:
+     - the most relevant node(s) you will talk about, AND
+     - any 1-hop callers/callees you need to explain the flow.
+   - Call `fetch_node_source(node_ids=[...])` **one time** with the combined list.
    - **Do not search again** for the same question.
 
-4. **Answer** from what you have. Stop when you can answer accurately.
+5. **Answer** from embedding text + neighbors when sufficient; use fetched excerpts when you need implementation detail.
 
-5. **Fallback only** — use Read/Grep/SemanticSearch if:
-   - search returned zero candidates, or
+6. **Do NOT use native Cursor Grep/Read/SemanticSearch** if GraphRAG returned useful buckets. If you need extra exact lookup, use `grep_graph_nodes` (not native Grep).
+
+7. **Fallback only** — use Read if:
+   - search returned zero nodes in all buckets, or
    - `fetch_node_source` returned `error`, or
-   - neighbors are empty and you still lack a required fact.
-
-Do not Read or Grep to “double-check” after a successful GraphRAG response.
+   - you need a non-Python file not in the graph.
 
 ---
 
-## How to write `search_queries`
+## How to write `search_queries` vs `grep_terms`
 
-- Short, keyword-dense strings. No filler (“where is”, “please find”, “how does”).
-- Include **synonyms + concrete terms** from the user’s question.
-- Include **symbol names** if the user mentioned them (e.g. `"Session"`, `"resolve_redirects"`).
-- Use **multiple strings** to cover different angles of the same question (not separate subsystems).
+| Field | Purpose | Example |
+|-------|---------|---------|
+| `search_queries` | Semantic intent (rewritten question) | `"HTTP redirect Location 301"`, `"retry 429 backoff"` |
+| `grep_terms` | Exact symbols (grep replacement) | `"Session"`, `"resolve_redirects"`, `"ALLOW_REDIRECTS"` |
+
+**search_queries** — short, keyword-dense. No filler (“where is”, “please find”).
+**grep_terms** — exact identifiers only. One term per string. These are what you would pass to Grep.
 
 Good:
 ```json
-["redirect Location 301 302", "resolve_redirects allow_redirects", "Session request send"]
+{
+  "search_queries": ["redirect Location 301 302", "follow redirect chain allow_redirects"],
+  "grep_terms": ["resolve_redirects", "Session", "is_redirect"]
+}
 ```
 
 Bad:
 ```json
-["Where does redirect handling happen after an HTTP response?"]
+{
+  "search_queries": ["Where does redirect handling happen after an HTTP response?"],
+  "grep_terms": []
+}
 ```
 
 ---
 
 ## Before code changes
 
-1. `search_codebase_intent` → find the symbol you will edit.
-2. `fetch_node_source` on that `node_id` if the search excerpt is insufficient.
+1. `search_codebase_intent` with `grep_terms` → find the symbol.
+2. `fetch_node_source` on that `node_id` if you need full implementation.
 3. `calculate_blast_radius(target_symbol="...")` on the symbol.
 4. Then propose or write changes.
 
@@ -173,8 +207,8 @@ Bad:
 ## Rules to prevent token waste
 
 - **One search per question.** Never call `search_codebase_intent` twice for the same question.
-- **Do not use `trace_callers`.**
-- **Do not use `targeted_symbols`.**
-- **Do not re-fetch** a `node_id` you already have a `source_excerpt` for unless you need a fresher copy.
-- **Batch** `fetch_node_source` calls — pass all needed `node_ids` in one request.
-- Prefer answering from search `source_excerpt` when it is sufficient (top 2 hits are designed for this).
+- **Always pass `grep_terms`** when the user mentions symbol names or you would otherwise grep.
+- **Do not use native Grep/Read/SemanticSearch** — use `grep_terms` in search or `grep_graph_nodes` and `fetch_node_source`.
+- **Do not use `trace_callers`** or `targeted_symbols`.
+- **Batch** `fetch_node_source` — pass all needed `node_ids` in one request (do not call it twice).
+- Answer from `embedding_text` + neighbors when enough; fetch source only when needed.

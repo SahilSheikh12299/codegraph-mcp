@@ -27,6 +27,8 @@ from advanced_engine import (
     # format_call_neighbors,
     get_call_neighbors,
     recompute_call_centrality,
+    build_grep_text,
+    grep_search_nodes,
     NEIGHBOR_ID_LIMIT,
     SOURCE_EXCERPT_MAX_LINES,
 )
@@ -198,6 +200,34 @@ def _text_for_embedding(data: dict) -> str:
     return (data.get("embedding_text") or data.get("chunk_text") or "").strip()
 
 
+def _backfill_grep_fields(G: nx.DiGraph, rel_paths: set[str] | None = None) -> None:
+    """Populate grep_text and name_embedding on CLASS/FUNCTION nodes."""
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") not in ("CLASS", "FUNCTION"):
+            continue
+        if rel_paths is not None and data.get("file_path") not in rel_paths:
+            continue
+        data["grep_text"] = build_grep_text(data)
+
+
+def _embed_name_vectors(G: nx.DiGraph, rel_path: str, embedder: LocalEmbeddingPipeline) -> int:
+    """Batch-encode node names for fuzzy grep fallback."""
+    nodes_to_encode: list[str] = []
+    texts_to_encode: list[str] = []
+    for node_id, data in G.nodes(data=True):
+        if data.get("file_path") != rel_path:
+            continue
+        name = (data.get("name") or "").strip()
+        if name:
+            nodes_to_encode.append(node_id)
+            texts_to_encode.append(name)
+    if texts_to_encode:
+        vectors = embedder.model.encode(texts_to_encode, convert_to_numpy=True).tolist()
+        for node_id, vector in zip(nodes_to_encode, vectors):
+            G.nodes[node_id]["name_embedding"] = vector
+    return len(texts_to_encode)
+
+
 def backfill_source_chunks(G: nx.DiGraph, repo_root: Path, rel_paths: set[str]) -> None:
     """Overlay real AST source segments and embedding_text onto graph nodes."""
     for rel_path in rel_paths:
@@ -219,10 +249,12 @@ def _embed_file_nodes(G: nx.DiGraph, rel_path: str, embedder: LocalEmbeddingPipe
             if text:
                 nodes_to_encode.append(node_id)
                 texts_to_encode.append(text)
+            data["grep_text"] = build_grep_text(data)
     if texts_to_encode:
         vectors = embedder.model.encode(texts_to_encode, convert_to_numpy=True).tolist()
         for node_id, vector in zip(nodes_to_encode, vectors):
             G.nodes[node_id]["embedding"] = vector
+    _embed_name_vectors(G, rel_path, embedder)
     return len(texts_to_encode)
 
 
@@ -276,6 +308,14 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
             if (repo_root / rel_path).exists():
                 _embed_file_nodes(G, rel_path, embedder)
         G.graph["chunk_schema"] = 3
+        schema_dirty = True
+
+    if G.graph.get("grep_schema") != 1:
+        _backfill_grep_fields(G)
+        for rel_path in tracked_files:
+            if (repo_root / rel_path).exists():
+                _embed_name_vectors(G, rel_path, embedder)
+        G.graph["grep_schema"] = 1
         schema_dirty = True
 
     if G.graph.get("calls_schema") != 1:
@@ -375,12 +415,20 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
                         print(f"  -> [MODIFIED] Element updated: `{node_id}`. Regenerating vector...")
                         emb_text = _text_for_embedding(fresh_data)
                         fresh_data["embedding"] = embedder.model.encode(emb_text, convert_to_numpy=True).tolist()
+                        fresh_data["grep_text"] = build_grep_text(fresh_data)
+                        name = (fresh_data.get("name") or "").strip()
+                        if name:
+                            fresh_data["name_embedding"] = embedder.model.encode(name, convert_to_numpy=True).tolist()
                         G.add_node(node_id, **fresh_data)
                 else:
                     # The node ID is brand new to the system
                     print(f"  -> [ADDED] New element detected: `{node_id}`. Generating vector...")
                     emb_text = _text_for_embedding(fresh_data)
                     fresh_data["embedding"] = embedder.model.encode(emb_text, convert_to_numpy=True).tolist()
+                    fresh_data["grep_text"] = build_grep_text(fresh_data)
+                    name = (fresh_data.get("name") or "").strip()
+                    if name:
+                        fresh_data["name_embedding"] = embedder.model.encode(name, convert_to_numpy=True).tolist()
                     G.add_node(node_id, **fresh_data)
                     
             # --- SUB-STEP B: EVALUATE DELETED ELEMENTS ---
@@ -413,19 +461,21 @@ def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalE
 def search_codebase_intent(
     search_queries: list[str],
     active_project_root: str,
+    grep_terms: list[str] | None = None,
     # targeted_symbols: list[str] = None,
     top_k: int = 8,
     format: str = "json",
     include_next_action: bool = True,
 ) -> str:
-    """Find code by intent. Returns top 2 hits with capped source + neighbor IDs.
+    """Find code by intent. With grep_terms, returns bucketed semantic + grep results (no source excerpts).
 
     Args:
-        search_queries: Keyword-dense strings, e.g. ["redirect Location 301", "resolve_redirects"].
-        active_project_root: Absolute path to the repo root.        
-        top_k: Max candidates to return (top 2 include source_excerpt).
+        search_queries: LLM-rewritten intent queries for semantic search.
+        active_project_root: Absolute path to the repo root.
+        grep_terms: Literal grep-style terms from the LLM (use instead of native grep).
+        top_k: Max candidates for legacy non-bucketed mode (top 2 include source_excerpt).
         format: "json" (default) or "markdown".
-        include_next_action: If true, suggest fetch_node_source for the top hit.
+        include_next_action: If true, suggest fetch_node_source for drill-down.
     """
     workspace_root = Path(active_project_root).resolve()
     graph_path, lock_path = get_graph_paths(workspace_root)
@@ -443,12 +493,87 @@ def search_codebase_intent(
             embedder_instance=embedder,
             reranker=reranker,
         )
+        if grep_terms:
+            return engine.compile_bucketed_context_package(
+                search_queries=search_queries,
+                grep_terms=grep_terms,
+                include_next_action=include_next_action,
+            )
         return engine.compile_context_package(
             search_queries=search_queries,
             top_k=top_k,
             output_format=format,
             include_next_action=include_next_action,
         )
+    finally:
+        model_manager.release()
+
+
+@mcp.tool()
+def grep_graph_nodes(
+    terms: list[str],
+    active_project_root: str,
+    case_sensitive: bool = False,
+    max_hits_per_term: int = 3,
+    format: str = "json",
+) -> str:
+    """Grep-replica over graph node text. Use instead of native grep for exact-string certainty.
+
+    Literal match returns top 1 per term; fuzzy fallback returns up to max_hits_per_term.
+    Each hit includes embedding_text + 5 callers/callees. Use fetch_node_source for full code.
+
+    Args:
+        terms: Literal search strings (same as grep patterns the LLM would use).
+        active_project_root: Absolute path to the repo root.
+        case_sensitive: Match case exactly when true.
+        max_hits_per_term: Cap for fuzzy mode (exact mode always returns 1).
+    """
+    workspace_root = Path(active_project_root).resolve()
+    graph_path, lock_path = get_graph_paths(workspace_root)
+
+    embedder = model_manager.acquire()
+    try:
+        with FileLock(lock_path):
+            G = GraphSerializer.load_from_json(workspace_root, graph_path)
+            if execute_preflight_lazy_sync(workspace_root, G, embedder):
+                GraphSerializer.save_to_json(G, workspace_root, graph_path)
+
+        buckets: list[dict[str, Any]] = []
+        all_ids: list[str] = []
+        for term in terms:
+            term = (term or "").strip()
+            if not term:
+                continue
+            nodes = grep_search_nodes(
+                G,
+                term,
+                case_sensitive=case_sensitive,
+                embedder=embedder,
+                fuzzy_top_k=max(1, int(max_hits_per_term)),
+            )
+            all_ids.extend(n["node_id"] for n in nodes)
+            buckets.append({
+                "term": term,
+                "match_mode": nodes[0]["match_mode"] if nodes else "none",
+                "nodes": nodes,
+            })
+
+        out: dict[str, Any] = {"terms": terms, "buckets": buckets}
+        if all_ids:
+            out["next_action"] = {
+                "tool": "fetch_node_source",
+                "args": {"node_ids": all_ids[:3]},
+            }
+        if format == "json":
+            return _json_dumps(out)
+        lines = ["## Grep Graph Results\n"]
+        for bucket in buckets:
+            lines.append(f"### Term: `{bucket['term']}` ({bucket['match_mode']})")
+            for node in bucket.get("nodes", []):
+                lines.append(f"- `{node['node_id']}` | {node.get('signature', '')}")
+                nb = node.get("neighbors") or {}
+                lines.append(f"  callers: {len(nb.get('callers', []))}, callees: {len(nb.get('callees', []))}")
+        return "\n".join(lines)
     finally:
         model_manager.release()
 

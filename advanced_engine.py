@@ -18,6 +18,10 @@ STAGE1_SEMANTIC_WEIGHT = 0.7
 STAGE1_KEYWORD_WEIGHT = 0.3
 SOURCE_EXCERPT_MAX_LINES = 100
 NEIGHBOR_ID_LIMIT = 50
+BUCKET_SEMANTIC_TOP_K = 3
+GREP_NEIGHBOR_LIMIT = 5
+GREP_FUZZY_TOP_K = 3
+GREP_EXACT_TOP_K = 1
 
 _STOPWORDS = frozenset({
     "the", "a", "an", "is", "are", "was", "were", "how", "what", "where", "when",
@@ -104,6 +108,129 @@ def build_rerank_passage(data: Dict[str, Any]) -> str:
     if meta and skeleton and skeleton != meta:
         return f"{meta}\n\n{skeleton}"
     return skeleton or meta
+
+
+def build_grep_text(data: Dict[str, Any]) -> str:
+    """Compact searchable text for literal grep-replica (no chunk_text)."""
+    parts = [
+        data.get("name") or "",
+        data.get("signature") or "",
+        data.get("file_path") or "",
+        data.get("embedding_text") or "",
+    ]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def format_compact_candidate(
+    G: nx.DiGraph,
+    node_id: str,
+    meta: Dict[str, Any],
+    *,
+    score: float | None = None,
+    neighbors_limit: int = GREP_NEIGHBOR_LIMIT,
+    match_mode: str | None = None,
+) -> Dict[str, Any]:
+    """Token-tight node payload: embedding_text + neighbor IDs only."""
+    callers, callees = get_call_neighbors(G, node_id, limit=neighbors_limit)
+    out: Dict[str, Any] = {
+        "node_id": node_id,
+        "type": meta.get("type"),
+        "file_path": meta.get("file_path"),
+        "name": meta.get("name"),
+        "signature": meta.get("signature", ""),
+        "embedding_text": (meta.get("embedding_text") or "").strip(),
+        "neighbors": {"callers": callers, "callees": callees},
+    }
+    if score is not None:
+        out["score"] = round(score, 4)
+    if match_mode:
+        out["match_mode"] = match_mode
+    return out
+
+
+def _grep_literal_rank(term: str, node_id: str, data: Dict[str, Any], case_sensitive: bool) -> float:
+    """Higher = better literal match (exact name preferred)."""
+    name = data.get("name") or ""
+    t = term if case_sensitive else term.lower()
+    n = name if case_sensitive else name.lower()
+    if n == t:
+        return 100.0
+    if n.endswith(f".{t}") or f".{t}" in node_id:
+        return 90.0
+    if t in n:
+        return 70.0 + float(data.get("call_centrality") or 0)
+    return 50.0 + float(data.get("call_centrality") or 0)
+
+
+def _grep_fuzzy_rank(term: str, node_id: str, data: Dict[str, Any], case_sensitive: bool) -> float:
+    """Token overlap on name/signature when no literal grep_text hit."""
+    t = term if case_sensitive else term.lower()
+    name = (data.get("name") or "")
+    sig = (data.get("signature") or "")
+    hay = f"{name} {sig}" if case_sensitive else f"{name} {sig}".lower()
+    if t in hay:
+        return 80.0 + float(data.get("call_centrality") or 0)
+    tokens = [tok for tok in re.findall(r"[a-zA-Z0-9_]+", t) if len(tok) >= 2]
+    if not tokens:
+        return 0.0
+    hits = sum(1 for tok in tokens if tok in hay)
+    return (hits / len(tokens)) * 50.0 + float(data.get("call_centrality") or 0)
+
+
+def grep_search_nodes(
+    G: nx.DiGraph,
+    term: str,
+    *,
+    case_sensitive: bool = False,
+    embedder: Any = None,
+    fuzzy_top_k: int = GREP_FUZZY_TOP_K,
+) -> List[Dict[str, Any]]:
+    """Literal grep on grep_text; exact mode returns top 1, fuzzy mode returns top 3."""
+    term = (term or "").strip()
+    if not term:
+        return []
+
+    literal_hits: list[tuple[str, Dict[str, Any], float]] = []
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") not in ("CLASS", "FUNCTION"):
+            continue
+        grep_text = data.get("grep_text") or build_grep_text(data)
+        hay = grep_text if case_sensitive else grep_text.lower()
+        needle = term if case_sensitive else term.lower()
+        if needle in hay:
+            score = _grep_literal_rank(term, node_id, data, case_sensitive)
+            literal_hits.append((node_id, data, score))
+
+    if literal_hits:
+        literal_hits.sort(key=lambda x: x[2], reverse=True)
+        top = literal_hits[:GREP_EXACT_TOP_K]
+        return [
+            format_compact_candidate(G, nid, meta, score=sc, match_mode="exact")
+            for nid, meta, sc in top
+        ]
+
+    fuzzy_hits: list[tuple[str, Dict[str, Any], float]] = []
+    term_vec = None
+    if embedder is not None:
+        term_vec = embedder.model.encode(term, convert_to_numpy=True).tolist()
+
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") not in ("CLASS", "FUNCTION"):
+            continue
+        score = _grep_fuzzy_rank(term, node_id, data, case_sensitive)
+        name_emb = data.get("name_embedding")
+        if term_vec and name_emb:
+            cos = float(np.dot(term_vec, name_emb) / (np.linalg.norm(term_vec) * np.linalg.norm(name_emb) + 1e-9))
+            score = max(score, cos * 60.0)
+        if score > 0:
+            fuzzy_hits.append((node_id, data, score))
+
+    fuzzy_hits.sort(key=lambda x: x[2], reverse=True)
+    top = fuzzy_hits[:fuzzy_top_k]
+    return [
+        format_compact_candidate(G, nid, meta, score=sc, match_mode="fuzzy")
+        for nid, meta, sc in top
+    ]
 
 
 def get_call_neighbors(G: nx.DiGraph, node_id: str, limit: int = 5) -> Tuple[List[str], List[str]]:
@@ -425,4 +552,62 @@ class AdvancedRetrievalEngine:
             markdown += "\n"
 
         return markdown
+
+    def compile_bucketed_context_package(
+        self,
+        search_queries: List[str],
+        grep_terms: List[str] | None = None,
+        *,
+        include_next_action: bool = True,
+    ) -> str:
+        """Bucketed retrieval: semantic top-3 + per-grep-term top-(1|3), no source excerpts."""
+        grep_terms = [t.strip() for t in (grep_terms or []) if t and t.strip()]
+        queries = [q.strip() for q in search_queries if q and q.strip()]
+
+        semantic_nodes: list[dict[str, Any]] = []
+        if queries:
+            query_hits = self.run_hybrid_retrieval(queries, keywords=[])
+            for hit in query_hits[:BUCKET_SEMANTIC_TOP_K]:
+                semantic_nodes.append(
+                    format_compact_candidate(
+                        self.G,
+                        hit["node_id"],
+                        hit["metadata"],
+                        score=hit["hybrid_score"],
+                        neighbors_limit=GREP_NEIGHBOR_LIMIT,
+                    )
+                )
+
+        grep_buckets: list[dict[str, Any]] = []
+        for term in grep_terms:
+            nodes = grep_search_nodes(
+                self.G,
+                term,
+                embedder=self.embedder,
+            )
+            grep_buckets.append({
+                "term": term,
+                "match_mode": nodes[0]["match_mode"] if nodes else "none",
+                "nodes": nodes,
+            })
+
+        all_ids = [n["node_id"] for n in semantic_nodes]
+        for bucket in grep_buckets:
+            all_ids.extend(n["node_id"] for n in bucket.get("nodes", []))
+
+        out: dict[str, Any] = {
+            "rewritten_queries": queries,
+            "grep_terms": grep_terms,
+            "semantic_bucket": {
+                "nodes": semantic_nodes,
+            },
+            "grep_buckets": grep_buckets,
+        }
+        if include_next_action and all_ids:
+            out["next_action"] = {
+                "tool": "fetch_node_source",
+                "args": {"node_ids": all_ids[:3]},
+                "hint": "Use fetch_node_source with node_ids when you need full source code.",
+            }
+        return json.dumps(out, ensure_ascii=False, separators=(",", ":"), default=str)
 

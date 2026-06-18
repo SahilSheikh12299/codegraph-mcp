@@ -11,6 +11,7 @@ try:
     from mcp_server import (
         calculate_blast_radius,
         search_codebase_intent,
+        grep_graph_nodes,
         get_graph_paths,
         trace_callers,
         fetch_node_source,
@@ -185,6 +186,66 @@ def run_system_audit() -> None:
         )
     except Exception as e:
         results.append(_verdict(False, f"redirect json parse failed: {e}"))
+
+    # --- 1d. bucketed search (semantic + grep terms) ---
+    _print_block(
+        "Step 1d — bucketed search (semantic + grep_terms)",
+        [
+            "Purpose: semantic top-3 + per-grep-term top-(1|3) with neighbor IDs, no source excerpts.",
+            f"Input: search_queries={REDIRECT_SEARCH_QUERIES[:1]}, grep_terms=['Session','resolve_redirects']",
+        ],
+    )
+    bucketed_json = search_codebase_intent(
+        search_queries=REDIRECT_SEARCH_QUERIES[:1],
+        grep_terms=["Session", "resolve_redirects"],
+        active_project_root=TEST_PROJECT_ROOT,
+    )
+    try:
+        bucketed = json.loads(bucketed_json)
+        semantic_nodes = (bucketed.get("semantic_bucket") or {}).get("nodes") or []
+        grep_buckets = bucketed.get("grep_buckets") or []
+        ok_semantic = 0 < len(semantic_nodes) <= 3
+        ok_buckets = len(grep_buckets) == 2
+        no_excerpts = all("source_excerpt" not in n for n in semantic_nodes)
+        for bucket in grep_buckets:
+            for node in bucket.get("nodes", []):
+                assert "source_excerpt" not in node
+                callers = (node.get("neighbors") or {}).get("callers") or []
+                callees = (node.get("neighbors") or {}).get("callees") or []
+                assert len(callers) <= 5
+                assert len(callees) <= 5
+        session_bucket = next((b for b in grep_buckets if b.get("term") == "Session"), None)
+        session_exact = session_bucket and session_bucket.get("match_mode") == "exact" and len(session_bucket.get("nodes", [])) == 1
+        print(f"  semantic_bucket: {len(semantic_nodes)} node(s)")
+        print(f"  grep_buckets: {len(grep_buckets)} term(s)")
+        if session_bucket:
+            print(f"  Session bucket: mode={session_bucket.get('match_mode')}, hits={len(session_bucket.get('nodes', []))}")
+        results.append(_verdict(ok_semantic and ok_buckets and no_excerpts, "bucketed structure valid"))
+        results.append(_verdict(session_exact, "Session exact hit returns top 1"))
+    except Exception as e:
+        results.append(_verdict(False, f"bucketed json parse failed: {e}"))
+
+    # --- 1e. grep_graph_nodes tool ---
+    _print_block(
+        "Step 1e — grep_graph_nodes",
+        [
+            "Purpose: grep-replica over graph node text.",
+            "Input: terms=['resolve_redirects']",
+        ],
+    )
+    grep_json = grep_graph_nodes(
+        terms=["resolve_redirects"],
+        active_project_root=TEST_PROJECT_ROOT,
+    )
+    try:
+        grep_parsed = json.loads(grep_json)
+        buckets = grep_parsed.get("buckets") or []
+        nodes = buckets[0].get("nodes", []) if buckets else []
+        ok = len(nodes) >= 1 and buckets[0].get("match_mode") == "exact"
+        print(f"  Returned: {len(nodes)} node(s), mode={buckets[0].get('match_mode') if buckets else 'none'}")
+        results.append(_verdict(ok, "grep_graph_nodes exact match for resolve_redirects"))
+    except Exception as e:
+        results.append(_verdict(False, f"grep json parse failed: {e}"))
 
     # --- 2. calculate_blast_radius ---
     _print_block(
