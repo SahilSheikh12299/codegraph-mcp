@@ -152,6 +152,188 @@ def build_embedding_text(
     return "\n".join(lines)
 
 
+_MAX_UNPARSE_LEN = 80
+_MAX_LIST_ITEMS = 30
+
+
+def _unparse_expr(node: ast.AST | None, max_len: int = _MAX_UNPARSE_LEN) -> str:
+    if node is None:
+        return ""
+    try:
+        text = ast.unparse(node)
+    except Exception:
+        return ""
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _assign_target_names(node: ast.AST) -> list[str]:
+    names: list[str] = []
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.append(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for elt in target.elts:
+                    if isinstance(elt, ast.Name):
+                        names.append(elt.id)
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        names.append(node.target.id)
+    elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+        names.append(node.target.id)
+    return names
+
+
+def _format_call_list(calls: set[str]) -> str:
+    return ", ".join(sorted(calls)[:_MAX_LIST_ITEMS])
+
+
+def _function_skeleton_lines(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    lines: list[str] = []
+    try:
+        header = ast.unparse(node).split("\n", 1)[0].rstrip(":")
+    except Exception:
+        args = [arg.arg for arg in node.args.args]
+        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        header = f"{prefix} {node.name}({', '.join(args)})"
+
+    lines.append(f"Signature: {header}")
+
+    if node.decorator_list:
+        decorators = ", ".join(_unparse_expr(d) for d in node.decorator_list)
+        lines.append(f"Decorators: {decorators}")
+
+    docstring = ast.get_docstring(node)
+    if docstring:
+        lines.append(f"Docstring: {docstring.strip()[:500]}")
+
+    if node.returns:
+        lines.append(f"Return type: {_unparse_expr(node.returns)}")
+
+    param_names = {arg.arg for arg in node.args.args}
+    calls: set[str] = set()
+    variables: set[str] = set()
+    yields: list[str] = []
+    returns: list[str] = []
+
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            name = _call_name(sub)
+            if name:
+                calls.add(name)
+        elif isinstance(sub, ast.Yield):
+            yields.append(_unparse_expr(sub.value) or "value")
+        elif isinstance(sub, ast.YieldFrom):
+            yields.append(f"from {_unparse_expr(sub.value)}")
+        elif isinstance(sub, ast.Return) and sub.value is not None:
+            returns.append(_unparse_expr(sub.value))
+        elif isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for var_name in _assign_target_names(sub):
+                if var_name not in param_names and var_name != "self":
+                    variables.add(var_name)
+
+    if calls:
+        lines.append(f"Calls: {_format_call_list(calls)}")
+    if variables:
+        lines.append(f"Variables: {', '.join(sorted(variables)[:_MAX_LIST_ITEMS])}")
+    if yields:
+        lines.append(f"Yields: {', '.join(yields[:5])}")
+    if returns:
+        lines.append(f"Return expressions: {', '.join(returns[:5])}")
+
+    return lines
+
+
+def _class_skeleton_lines(node: ast.ClassDef) -> list[str]:
+    lines = [f"Type: CLASS", f"Name: {node.name}"]
+
+    if node.bases:
+        lines.append(f"Inherits: {', '.join(_unparse_expr(b) for b in node.bases)}")
+
+    docstring = ast.get_docstring(node)
+    if docstring:
+        lines.append(f"Docstring: {docstring.strip()[:500]}")
+
+    attributes: list[str] = []
+    methods: list[str] = []
+    all_calls: set[str] = set()
+
+    for sub in node.body:
+        if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+            for name in _assign_target_names(sub):
+                attributes.append(name)
+        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            try:
+                methods.append(ast.unparse(sub).split("\n", 1)[0].rstrip(":"))
+            except Exception:
+                args = [arg.arg for arg in sub.args.args]
+                prefix = "async def" if isinstance(sub, ast.AsyncFunctionDef) else "def"
+                methods.append(f"{prefix} {sub.name}({', '.join(args)})")
+            method_doc = ast.get_docstring(sub)
+            if method_doc:
+                first = method_doc.strip().split("\n")[0][:120]
+                methods[-1] = f"{methods[-1]}  # {first}"
+            for call_node in ast.walk(sub):
+                if isinstance(call_node, ast.Call):
+                    name = _call_name(call_node)
+                    if name:
+                        all_calls.add(name)
+
+    if attributes:
+        lines.append(f"Attributes: {', '.join(attributes[:_MAX_LIST_ITEMS])}")
+    if methods:
+        lines.append("Methods:")
+        lines.extend(f"  - {m}" for m in methods[:_MAX_LIST_ITEMS])
+    if all_calls:
+        lines.append(f"Calls: {_format_call_list(all_calls)}")
+
+    return lines
+
+
+def build_semantic_skeleton(
+    chunk_text: str,
+    node_type: str = "FUNCTION",
+    *,
+    data: Dict[str, Any] | None = None,
+) -> str:
+    """AST-extracted symbols for cross-encoder reranking (no loop/if bodies)."""
+    data = data or {}
+    if not chunk_text or not chunk_text.strip():
+        return (data.get("embedding_text") or "").strip()
+
+    try:
+        tree = ast.parse(chunk_text.strip())
+    except SyntaxError:
+        return (data.get("embedding_text") or chunk_text[:500]).strip()
+
+    if not tree.body:
+        return (data.get("embedding_text") or "").strip()
+
+    top = tree.body[0]
+    if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        lines = _function_skeleton_lines(top)
+    elif isinstance(top, ast.ClassDef):
+        lines = _class_skeleton_lines(top)
+    else:
+        return (data.get("embedding_text") or "").strip()
+
+    if data.get("belongs_to_class"):
+        lines.insert(1, f"Class: {data['belongs_to_class']}")
+    if data.get("file_path"):
+        lines.append(f"File: {data['file_path']}")
+
+    return "\n".join(lines)
+
+
 def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
     """Parses a python file using its absolute path, but labels the nodes
 

@@ -6,16 +6,16 @@
 import numpy as np
 import networkx as nx
 from typing import List, Dict, Any, Tuple
-import ast
 import json
 import re
+
+from fileParsing.scanAST import build_semantic_skeleton
 
 SEARCH_RESULT_LIMIT = 6
 SEMANTIC_POOL_SIZE = 50
 STAGE1_POOL_SIZE = 20
 STAGE1_SEMANTIC_WEIGHT = 0.7
 STAGE1_KEYWORD_WEIGHT = 0.3
-RERANK_PASSAGE_MAX_LINES = 40
 SOURCE_EXCERPT_MAX_LINES = 100
 NEIGHBOR_ID_LIMIT = 50
 
@@ -94,16 +94,16 @@ def extract_source_excerpt(
 
 
 def build_rerank_passage(data: Dict[str, Any]) -> str:
-    """Metadata + capped source body for cross-encoder reranking."""
+    """Compact embedding metadata + AST semantic skeleton for cross-encoder reranking."""
     meta = (data.get("embedding_text") or "").strip()
-    body = extract_source_excerpt(
+    skeleton = build_semantic_skeleton(
         data.get("chunk_text", ""),
         data.get("type", "FUNCTION"),
-        max_lines=RERANK_PASSAGE_MAX_LINES,
+        data=data,
     )
-    if meta and body:
-        return f"{meta}\n\n{body}"
-    return meta or body
+    if meta and skeleton and skeleton != meta:
+        return f"{meta}\n\n{skeleton}"
+    return skeleton or meta
 
 
 def get_call_neighbors(G: nx.DiGraph, node_id: str, limit: int = 5) -> Tuple[List[str], List[str]]:
@@ -425,57 +425,4 @@ class AdvancedRetrievalEngine:
             markdown += "\n"
 
         return markdown
-        
-    def _create_surgical_preview(self, chunk_text: str) -> str:
-        """Surgically cuts operational body execution tasks out of the preview display."""
-        if not chunk_text:
-            return "# No implementation source found."
-            
-        try:
-            tree = ast.parse(chunk_text.strip())
-            if not tree.body:
-                return chunk_text.strip()
-                
-            top_node = tree.body[0]
-
-            if isinstance(top_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                docstring = ast.get_docstring(top_node)
-                skeletal_body = []
-                if docstring:
-                    skeletal_body.append(ast.Expr(value=ast.Constant(value=docstring)))
-                placeholder_msg = "... [Execution Logic Truncated. Use 'fetch_node_source' tool to view full logic] ..."
-                skeletal_body.append(ast.Expr(value=ast.Constant(value=placeholder_msg)))
-                top_node.body = skeletal_body
-                return ast.unparse(top_node)
-
-            elif isinstance(top_node, ast.ClassDef):
-                class_docstring = ast.get_docstring(top_node)
-                skeletal_class_contents = []
-                
-                if class_docstring:
-                    skeletal_class_contents.append(ast.Expr(value=ast.Constant(value=class_docstring)))
-                    
-                for sub_node in top_node.body:
-                    if isinstance(sub_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        method_docstring = ast.get_docstring(sub_node)
-                        skeletal_method_body = []
-                        if method_docstring:
-                            skeletal_method_body.append(ast.Expr(value=ast.Constant(value=method_docstring)))
-                        skeletal_method_body.append(ast.Pass())
-                        sub_node.body = skeletal_method_body
-                        skeletal_class_contents.append(sub_node)
-                    elif isinstance(sub_node, (ast.Assign, ast.AnnAssign)):
-                        skeletal_class_contents.append(sub_node)
-                        
-                if not skeletal_class_contents:
-                    skeletal_class_contents.append(ast.Pass())
-                    
-                top_node.body = skeletal_class_contents
-                return ast.unparse(top_node)
-                
-        except Exception:
-            lines = chunk_text.splitlines()
-            if len(lines) <= 12:
-                return chunk_text.strip()
-            return "\n".join(lines[:12]) + "\n\n        ... [Fallback Truncation Active] ..."
 
