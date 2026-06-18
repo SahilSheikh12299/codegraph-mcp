@@ -1,0 +1,180 @@
+# GraphRAG — Code Discovery Rules
+
+Use the GraphRAG MCP server **before** Read, Grep, or SemanticSearch when locating or understanding code.
+
+Always pass `active_project_root` as the **absolute path** to the repo root.
+
+---
+
+## Tools (what each one does)
+
+### 1. `search_codebase_intent` — **start here**
+
+Finds code by meaning + keywords. **Call this once per question.**
+
+**Required args:**
+- `search_queries` — list of short, keyword-dense strings (see below)
+- `active_project_root` — absolute repo root path
+
+**Optional args (defaults are fine):**
+- `top_k=8` — max candidates returned
+- `format="json"` — always use JSON
+- `include_next_action=True`
+
+**Do NOT use:** `targeted_symbols` — deprecated and ignored. Put function/class names inside `search_queries` instead.
+
+**Returns (JSON):**
+```json
+{
+  "queries": ["..."],
+  "keywords": ["..."],
+  "candidates": [
+    {
+      "node_id": "src/foo.py::Class.method",
+      "type": "FUNCTION",
+      "file_path": "src/foo.py",
+      "name": "method",
+      "signature": "(self, ...)",
+      "score": 0.82,
+      "source_excerpt": "... capped code (top 2 only) ...",
+      "neighbors": {
+        "callers": ["src/foo.py::Other.method"],
+        "callees": ["src/bar.py::helper"]
+      }
+    }
+  ],
+  "next_action": { "tool": "fetch_node_source", "args": { "node_ids": ["..."] } }
+}
+```
+
+- **Top 2** candidates include `source_excerpt` (max ~100 lines + return line if truncated).
+- **All** candidates include `neighbors` (direct caller/callee `node_id`s only — no source).
+- Candidates ranked 3+ have metadata only (no `source_excerpt`).
+
+---
+
+### 2. `fetch_node_source` — **dig deeper (optional)**
+
+Fetches capped source for specific `node_id`s. Use when search excerpts are not enough.
+
+**Required args:**
+- `node_ids` — list of exact IDs from `candidates[].node_id` or `candidates[].neighbors`
+- `active_project_root` — absolute repo root path
+
+**Optional args:** defaults are fine. `format="json"` is default.
+
+**Do NOT pass:** `mode`, `slices`, `include_neighbors` — these are legacy and ignored. Behavior is always the same.
+
+**Returns (JSON):**
+```json
+{
+  "nodes": [
+    {
+      "node_id": "src/foo.py::Class.method",
+      "type": "FUNCTION",
+      "file_path": "src/foo.py",
+      "name": "method",
+      "signature": "(self, ...)",
+      "source_excerpt": "... capped code ...",
+      "neighbors": { "callers": ["..."], "callees": ["..."] }
+    }
+  ]
+}
+```
+
+Pass **multiple** `node_ids` in one call when following neighbors (batch fetch).
+
+---
+
+### 3. `calculate_blast_radius` — **only before editing code**
+
+Lists upstream code that would break if you change a symbol. **Not for discovery.**
+
+**Required args:**
+- `target_symbol` — bare name, e.g. `"resolve_redirects"` or `"Session.request"`
+- `active_project_root` — absolute repo root path
+
+**Optional:** `format="json"`, `max_items=50`
+
+---
+
+### 4. `trace_callers` — **deprecated, do not use**
+
+Returns a deprecation message. Neighbors are already in search/fetch output. Use `fetch_node_source` instead.
+
+---
+
+## Discovery workflow
+
+For every “where / how does X work?” question:
+
+1. **Search once** — single `search_codebase_intent` call.
+   - Put **all** keywords and symbol names in `search_queries` (multiple strings OK).
+   - Example for redirect handling:
+     ```json
+     {
+       "search_queries": [
+         "HTTP redirect response Location header 301 302",
+         "resolve_redirects allow_redirects",
+         "is_redirect status code"
+       ],
+       "active_project_root": "/absolute/path/to/repo"
+     }
+     ```
+
+2. **Read the response** — top 2 hits already include `source_excerpt` + `neighbors`.
+   - Prefer higher `score`.
+   - For flow questions, prefer nodes with more `neighbors.callers` (entry-point-ish).
+   - Prefer the **method** over its parent **class** when both appear.
+
+3. **Fetch only if needed** — one `fetch_node_source` call with relevant `node_ids` from `neighbors`.
+   - Batch multiple IDs in a single call.
+   - **Do not search again** for the same question.
+
+4. **Answer** from what you have. Stop when you can answer accurately.
+
+5. **Fallback only** — use Read/Grep/SemanticSearch if:
+   - search returned zero candidates, or
+   - `fetch_node_source` returned `error`, or
+   - neighbors are empty and you still lack a required fact.
+
+Do not Read or Grep to “double-check” after a successful GraphRAG response.
+
+---
+
+## How to write `search_queries`
+
+- Short, keyword-dense strings. No filler (“where is”, “please find”, “how does”).
+- Include **synonyms + concrete terms** from the user’s question.
+- Include **symbol names** if the user mentioned them (e.g. `"Session"`, `"resolve_redirects"`).
+- Use **multiple strings** to cover different angles of the same question (not separate subsystems).
+
+Good:
+```json
+["redirect Location 301 302", "resolve_redirects allow_redirects", "Session request send"]
+```
+
+Bad:
+```json
+["Where does redirect handling happen after an HTTP response?"]
+```
+
+---
+
+## Before code changes
+
+1. `search_codebase_intent` → find the symbol you will edit.
+2. `fetch_node_source` on that `node_id` if the search excerpt is insufficient.
+3. `calculate_blast_radius(target_symbol="...")` on the symbol.
+4. Then propose or write changes.
+
+---
+
+## Rules to prevent token waste
+
+- **One search per question.** Never call `search_codebase_intent` twice for the same question.
+- **Do not use `trace_callers`.**
+- **Do not use `targeted_symbols`.**
+- **Do not re-fetch** a `node_id` you already have a `source_excerpt` for unless you need a fresher copy.
+- **Batch** `fetch_node_source` calls — pass all needed `node_ids` in one request.
+- Prefer answering from search `source_excerpt` when it is sufficient (top 2 hits are designed for this).
