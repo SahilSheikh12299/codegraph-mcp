@@ -130,6 +130,23 @@ class CodeGraph:
         )
         return node_id
 
+    def add_constant_node(
+        self,
+        const_name: str,
+        file_path: str,
+        line_span: Tuple[int, int],
+    ) -> str:
+        node_id = f"{file_path}::{const_name}"
+        self.graph.add_node(
+            node_id,
+            type="CONSTANT",
+            name=const_name,
+            file_path=file_path,
+            line_span=line_span,
+            signature="",
+        )
+        return node_id
+
     # ==========================================
     # VERBS: Edge Creation Methods
     # ==========================================
@@ -355,6 +372,14 @@ class RepositoryGraphCompiler:
                     # File contains the method text footprint structurally
                     self.cg.add_contains_edge(file_id, method_id)
 
+            for g in assets.get("globals", []):
+                const_id = self.cg.add_constant_node(
+                    g["name"],
+                    file_path,
+                    tuple(g.get("line_span", (0, 0))),
+                )
+                self.cg.add_contains_edge(file_id, const_id)
+
         # --- PHASE 2: CROSS-FILE DEPENDENCY RESOLUTION ---
         print("Phase 2: Resolving cross-file imports and object inheritance maps...")
         # 1. Build rapid global lookup maps for both Classes and Functions before resolving
@@ -437,6 +462,8 @@ class CodeChunker:
                 chunk = self._build_class_chunk(node_id, data)
             elif node_type == "FUNCTION":
                 chunk = self._build_function_chunk(node_id, data)
+            elif node_type == "CONSTANT":
+                chunk = data.get("chunk_text") or f"Entity Type: CONSTANT\nName: {data.get('name', '')}"
             else:
                 continue
 

@@ -55,6 +55,54 @@ def _is_stub_source(source: str) -> bool:
     return s.endswith("...") or s.endswith(": ...")
 
 
+def _parse_line_span(node_data: dict) -> tuple[int | None, int | None]:
+    span = node_data.get("line_span")
+    if not span or not isinstance(span, (list, tuple)) or len(span) < 2:
+        return None, None
+    return int(span[0]), int(span[1])
+
+
+def _source_completeness_fields(source: str) -> dict[str, Any]:
+    lines = (source or "").splitlines()
+    return {
+        "source_complete": True,
+        "truncated": False,
+        "line_count": len(lines),
+        "source_kind": "ast_bound_full_body",
+    }
+
+
+def _constant_fallback(workspace_root: Path, node_id: str) -> dict[str, Any] | None:
+    if "::" not in node_id:
+        return None
+    rel_path, name = node_id.rsplit("::", 1)
+    if "." in name:
+        return None
+    full = workspace_root / rel_path
+    if not full.is_file():
+        return None
+    for g in ASTParser(file_path=full).parse().get("globals", []):
+        if g["name"] != name:
+            continue
+        file_lines = full.read_text(encoding="utf-8").splitlines()
+        start, end = g["line_span"]
+        source = "\n".join(file_lines[start - 1 : end])
+        return {
+            "node_id": node_id,
+            "type": "CONSTANT",
+            "file_path": rel_path,
+            "name": name,
+            "signature": "",
+            "start_line": start,
+            "end_line": end,
+            "source": source,
+            **_source_completeness_fields(source),
+            "neighbors": {"callers": [], "callees": []},
+            "resolved_via": "fallback_inline",
+        }
+    return None
+
+
 def _find_impl_alternate(G: nx.DiGraph, node_id: str, node_data: dict) -> str | None:
     """If node is a Protocol stub, find a fuller same-name implementation in the same file."""
     name, file_path = node_data.get("name"), node_data.get("file_path")
@@ -200,7 +248,7 @@ def _text_for_embedding(data: dict) -> str:
 def _backfill_grep_fields(G: nx.DiGraph, rel_paths: set[str] | None = None) -> None:
     """Populate grep_text and name_embedding on CLASS/FUNCTION nodes."""
     for node_id, data in G.nodes(data=True):
-        if data.get("type") not in ("CLASS", "FUNCTION"):
+        if data.get("type") not in ("CLASS", "FUNCTION", "CONSTANT"):
             continue
         if rel_paths is not None and data.get("file_path") not in rel_paths:
             continue
@@ -232,6 +280,8 @@ def backfill_source_chunks(G: nx.DiGraph, repo_root: Path, rel_paths: set[str]) 
             if G.has_node(node_id):
                 G.nodes[node_id]["chunk_text"] = data["chunk_text"]
                 G.nodes[node_id]["embedding_text"] = data["embedding_text"]
+                if data.get("line_span"):
+                    G.nodes[node_id]["line_span"] = data["line_span"]
             else:
                 G.add_node(node_id, **data)
 
@@ -644,10 +694,15 @@ def _build_node_payload(
     node_id: str,
     *,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
+    workspace_root: Path | None = None,
 ) -> dict[str, Any]:
     """Single node: full source + 1-hop neighbor IDs."""
     if not G.has_node(node_id):
-        return {"node_id": node_id, "error": f"Node ID '{node_id}' not found."}
+        if workspace_root is not None:
+            fb = _constant_fallback(workspace_root, node_id)
+            if fb:
+                return fb
+        return {"node_id": node_id, "error": "not_indexed"}
 
     node_data = G.nodes[node_id]
     node_type = node_data.get("type", "UNKNOWN")
@@ -663,6 +718,8 @@ def _build_node_payload(
 
     callers, callees = get_call_neighbors(G, resolved_id, limit=neighbors_max)
     neighbors = {"callers": callers, "callees": callees}
+    source = (chunk_text or "").strip()
+    start_line, end_line = _parse_line_span(node_data)
 
     payload: dict[str, Any] = {
         "node_id": resolved_id,
@@ -670,7 +727,10 @@ def _build_node_payload(
         "file_path": node_data.get("file_path"),
         "name": node_data.get("name"),
         "signature": node_data.get("signature", ""),
-        "source": (chunk_text or "").strip(),
+        "start_line": start_line,
+        "end_line": end_line,
+        "source": source,
+        **_source_completeness_fields(source),
         "neighbors": neighbors,
     }
 
@@ -722,9 +782,10 @@ def fetch_node_source(
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
     format: str = "json",
 ) -> str:
-    """Full AST-bound source + 1-hop neighbor IDs for one or more node_ids.
+    """Full AST-bound source + citation lines + neighbor IDs for one or more node_ids.
 
-    Neighbors are always included.
+    Each node includes start_line, end_line, source_complete: true (never truncated).
+    Module constants use node_id like path/file.py::CONSTANT_NAME.
 
     Args:
         node_ids: Exact node_id(s) from search output neighbors or candidates.
@@ -743,11 +804,20 @@ def fetch_node_source(
                 GraphSerializer.save_to_json(G, workspace_root, graph_path)
 
         nodes = [
-            _build_node_payload(G, node_id, neighbors_max=neighbors_max)
+            _build_node_payload(
+                G, node_id, neighbors_max=neighbors_max, workspace_root=workspace_root
+            )
             for node_id in node_ids
         ]
         if format == "json":
-            return _json_dumps({"nodes": nodes})
+            ok = all(
+                n.get("source_complete") and not n.get("error") for n in nodes
+            )
+            return _json_dumps({
+                "nodes": nodes,
+                "do_not_use_native_read": ok,
+                "sufficient_to_answer": ok,
+            })
 
         parts = [
             _format_node_source(

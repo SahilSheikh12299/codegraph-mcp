@@ -367,6 +367,7 @@ def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
                 "name": node.name,
                 "file_path": rel_path,
                 "chunk_text": ast.get_source_segment(source, node),
+                "line_span": (node.lineno, node.end_lineno or node.lineno),
                 "docstring": docstring,
                 "bases": bases,
                 "embedding_text": build_embedding_text(
@@ -392,6 +393,7 @@ def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
                 "name": node.name,
                 "file_path": rel_path,
                 "chunk_text": ast.get_source_segment(source, node),
+                "line_span": (node.lineno, node.end_lineno or node.lineno),
                 "signature": signature,
                 "docstring": docstring,
                 "belongs_to_class": self.current_class,
@@ -404,6 +406,23 @@ def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
                 ),
             }
             self.generic_visit(node)
+
+        def visit_Assign(self, node):
+            if self.current_class is not None:
+                return
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                node_id = f"{rel_path}::{target.id}"
+                entities[node_id] = {
+                    "type": "CONSTANT",
+                    "name": target.id,
+                    "file_path": rel_path,
+                    "chunk_text": ast.get_source_segment(source, node) or "",
+                    "line_span": (node.lineno, node.end_lineno or node.lineno),
+                    "signature": "",
+                    "embedding_text": build_embedding_text("CONSTANT", target.id),
+                }
 
     visitor = RepoASTVisitor()
     visitor.visit(tree)

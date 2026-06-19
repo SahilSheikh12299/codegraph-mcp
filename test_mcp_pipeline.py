@@ -280,7 +280,6 @@ def run_system_audit() -> None:
     )
     trace_output = trace_callers(
         node_id=CALL_GRAPH_NODE,
-        active_project_root=TEST_PROJECT_ROOT,
         format="json",
     )
     try:
@@ -309,17 +308,21 @@ def run_system_audit() -> None:
         nodes = fetch_parsed.get("nodes") or []
         node = nodes[0] if nodes else {}
         has_source = bool(node.get("source"))
+        has_lines = node.get("start_line") is not None and node.get("end_line") is not None
+        source_complete = node.get("source_complete") is True
         neighbors = node.get("neighbors") or {}
         has_neighbors = bool(neighbors.get("callers") or neighbors.get("callees"))
         print(f"  Returned: {len(nodes)} node(s)")
         print(f"    has source: {has_source}")
+        print(f"    start_line/end_line: {node.get('start_line')}/{node.get('end_line')}")
+        print(f"    source_complete: {source_complete}")
         print(f"    callers: {len(neighbors.get('callers', []))}, callees: {len(neighbors.get('callees', []))}")
         results.append(
             _verdict(
-                has_source and has_neighbors,
-                "fetch returns full source and neighbor IDs"
-                if has_source and has_neighbors
-                else "missing source or neighbors",
+                has_source and has_neighbors and has_lines and source_complete,
+                "fetch returns full source, line range, and neighbor IDs"
+                if has_source and has_neighbors and has_lines and source_complete
+                else "missing source, line range, neighbors, or completeness flag",
             )
         )
     except Exception as e:

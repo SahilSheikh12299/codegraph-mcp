@@ -110,6 +110,15 @@ def build_rerank_passage(data: Dict[str, Any]) -> str:
     return skeleton or meta
 
 
+def graph_coverage_fields(G: nx.DiGraph) -> dict[str, Any]:
+    file_nodes = [d for _, d in G.nodes(data=True) if d.get("type") == "FILE"]
+    return {
+        "python_files_indexed": len(file_nodes),
+        "last_indexed_at": G.graph.get("last_synced_at"),
+        "missing_paths": [],
+    }
+
+
 def build_grep_text(data: Dict[str, Any]) -> str:
     """Compact searchable text for literal grep-replica (no chunk_text)."""
     parts = [
@@ -132,12 +141,18 @@ def format_compact_candidate(
 ) -> Dict[str, Any]:
     """Token-tight node payload: embedding_text + neighbor IDs only."""
     callers, callees = get_call_neighbors(G, node_id, limit=neighbors_limit)
+    start_line, end_line = None, None
+    span = meta.get("line_span")
+    if span and isinstance(span, (list, tuple)) and len(span) >= 2:
+        start_line, end_line = int(span[0]), int(span[1])
     out: Dict[str, Any] = {
         "node_id": node_id,
         "type": meta.get("type"),
         "file_path": meta.get("file_path"),
         "name": meta.get("name"),
         "signature": meta.get("signature", ""),
+        "start_line": start_line,
+        "end_line": end_line,
         "embedding_text": (meta.get("embedding_text") or "").strip(),
         "neighbors": {"callers": callers, "callees": callees},
     }
@@ -192,7 +207,7 @@ def grep_search_nodes(
 
     literal_hits: list[tuple[str, Dict[str, Any], float]] = []
     for node_id, data in G.nodes(data=True):
-        if data.get("type") not in ("CLASS", "FUNCTION"):
+        if data.get("type") not in ("CLASS", "FUNCTION", "CONSTANT"):
             continue
         grep_text = data.get("grep_text") or build_grep_text(data)
         hay = grep_text if case_sensitive else grep_text.lower()
@@ -215,7 +230,7 @@ def grep_search_nodes(
         term_vec = embedder.model.encode(term, convert_to_numpy=True).tolist()
 
     for node_id, data in G.nodes(data=True):
-        if data.get("type") not in ("CLASS", "FUNCTION"):
+        if data.get("type") not in ("CLASS", "FUNCTION", "CONSTANT"):
             continue
         score = _grep_fuzzy_rank(term, node_id, data, case_sensitive)
         name_emb = data.get("name_embedding")
@@ -508,17 +523,27 @@ class AdvancedRetrievalEngine:
                     "neighbors": _neighbor_ids(node_id),
                 }
                 if idx < 2 and meta.get("chunk_text"):
-                    candidate["source_excerpt"] = extract_source_excerpt(
+                    excerpt = extract_source_excerpt(
                         meta.get("chunk_text", ""),
                         meta.get("type", "FUNCTION"),
                     )
+                    candidate["source_excerpt"] = excerpt
+                    truncated = "# ... truncated" in excerpt
+                    candidate["truncated"] = truncated
+                    candidate["source_complete"] = not truncated
+                    if truncated:
+                        candidate["fetch_hint"] = "Call fetch_node_source for full source."
                 candidates.append(candidate)
 
             best_id = candidates[0]["node_id"] if candidates else None
+            has_hits = bool(candidates)
             out: dict[str, Any] = {
                 "queries": search_queries,
                 "keywords": keywords,
                 "candidates": candidates,
+                "graph_coverage": graph_coverage_fields(self.G),
+                "sufficient_to_answer": has_hits,
+                "do_not_use_native_read": has_hits,
             }
             if include_next_action and best_id:
                 out["next_action"] = {
@@ -595,6 +620,7 @@ class AdvancedRetrievalEngine:
         for bucket in grep_buckets:
             all_ids.extend(n["node_id"] for n in bucket.get("nodes", []))
 
+        has_hits = bool(semantic_nodes) or any(b.get("nodes") for b in grep_buckets)
         out: dict[str, Any] = {
             "rewritten_queries": queries,
             "grep_terms": grep_terms,
@@ -602,6 +628,9 @@ class AdvancedRetrievalEngine:
                 "nodes": semantic_nodes,
             },
             "grep_buckets": grep_buckets,
+            "graph_coverage": graph_coverage_fields(self.G),
+            "sufficient_to_answer": has_hits,
+            "do_not_use_native_read": has_hits,
         }
         if include_next_action and all_ids:
             out["next_action"] = {

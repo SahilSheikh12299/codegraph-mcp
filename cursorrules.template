@@ -65,7 +65,10 @@ When `grep_terms` is provided, the server returns **bucketed** results (no sourc
       ]
     }
   ],
-  "next_action": { "tool": "fetch_node_source", "args": { "node_ids": ["..."] } }
+  "next_action": { "tool": "fetch_node_source", "args": { "node_ids": ["..."] } },
+  "graph_coverage": { "python_files_indexed": 142, "missing_paths": [] },
+  "sufficient_to_answer": true,
+  "do_not_use_native_read": true
 }
 ```
 
@@ -109,6 +112,26 @@ Fetches **full** AST-bound source for specific `node_id`s. Use when you need imp
 **Not supported (do not pass):** `max_lines`, `include_neighbors`, `mode`, `slices`.
 
 **Returns:** `source` (full function/class body from the graph) + neighbor IDs per node.
+
+Each node includes citation-ready fields:
+
+```json
+{
+  "node_id": "src/foo.py::Class.method",
+  "file_path": "src/foo.py",
+  "start_line": 42,
+  "end_line": 87,
+  "source": "def method(self): ...",
+  "source_complete": true,
+  "truncated": false,
+  "line_count": 46,
+  "source_kind": "ast_bound_full_body"
+}
+```
+
+Module-level constants are indexed as `path/to/file.py::CONSTANT_NAME` (`type: CONSTANT`). Grep them via `grep_terms` or `grep_graph_nodes`.
+
+**Citation rule:** When `fetch_node_source` returns `start_line`/`end_line`, cite using `startLine:endLine:filepath` from MCP fields only. Do **not** open the file with native Read for line numbers.
 
 **Critical batching rule:** collect ALL `node_id`s you might need (top hits + relevant callers/callees) and call `fetch_node_source` **once** with a single combined list. Do not call `fetch_node_source` twice for the same question unless the first call returned `error`.
 
@@ -178,7 +201,7 @@ For every “where / how does X work?” question:
 | Field | Purpose | Example |
 |-------|---------|---------|
 | `search_queries` | Semantic intent (rewritten question) | `"HTTP redirect Location 301"`, `"retry 429 backoff"` |
-| `grep_terms` | Exact symbols (grep replacement) | `"Session"`, `"resolve_redirects"`, `"ALLOW_REDIRECTS"` |
+| `grep_terms` | Exact symbols (grep replacement) | `"Session"`, `"resolve_redirects"`, `"REDIRECT_STATI"` |
 
 **search_queries** — short, keyword-dense. No filler (“where is”, “please find”).
 **grep_terms** — exact identifiers only. One term per string. These are what you would pass to Grep.
@@ -215,6 +238,7 @@ Bad:
 - **One search per question.** Never call `search_codebase_intent` twice for the same question.
 - **Always pass `grep_terms`** when the user mentions symbol names or you would otherwise grep.
 - **Do not use native Grep/Read/SemanticSearch** — use `grep_terms` in search or `grep_graph_nodes` and `fetch_node_source`.
+- After a successful `fetch_node_source` with `source_complete: true`, native Grep/Read is **forbidden** (not discouraged) — cite from MCP `start_line`/`end_line`/`file_path`.
 - **Do not use `trace_callers`** or `targeted_symbols`.
 - **Batch** `fetch_node_source` — pass all needed `node_ids` in one request (do not call it twice).
 - **Do not pass** `max_lines`, `include_neighbors`, `mode`, or `slices` to `fetch_node_source` — they are not tool parameters.
