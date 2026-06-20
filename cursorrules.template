@@ -1,142 +1,102 @@
 # GraphRAG — Code Discovery Rules
 
-Always pass `active_project_root` (absolute repo root) on **every** tool call. Reuse the same path throughout a session.
+Always pass `active_project_root` (absolute repo root) on every tool call. Reuse the same path throughout a session.
+
+**Primary goal:** answer or edit with the **least token usage possible**. GraphRAG is a swiss-army-knife for repo discovery — far better than grep — but only when you use it surgically. Every extra search or read wastes tokens.
 
 ---
 
-## Output contract
+## The only discovery tool
 
-All GraphRAG tools return **markdown only**.
+**`search_codebase_intent`** is the only GraphRAG tool. Use it for all repo discovery.
 
-- Code appears in **Cursor citation fences**: `startLine:endLine:filepath` as the fence info string.
-- **Copy citation blocks directly** into your answer; do not reformat or rebuild them.
-- Each search hit includes a `node_id:` line — use it only when you need deeper reads via `fetch_snippets` or `fetch_node_source`.
+Do **not** use native Grep, SemanticSearch, or iterative file hunting to explore the codebase.
 
 ---
 
-## Which tool to use (pick ONE per step)
+## Efficiency first
 
-### "How does X work?" / starting discovery
-**Tool:** `search_codebase_intent`
-- Pass `search_queries` (intent phrases) **and** `grep_terms` (symbol names you know).
-- Returns markdown hits, **query-ranked call chains**, and **inline citation snippets** (default).
-- Usually **no follow-up tool** is needed. Escalate to `fetch_node_source` only if snippets are truncated.
-
-### Search snippets truncated or you need more nodes
-**Tool:** `fetch_snippets`
-- Pass `node_ids` from the `node_id:` line in search output.
-- Returns citation blocks for additional nodes.
-
-### You need the full function/class body to cite or edit
-**Tool:** `fetch_node_source`
-- Same `node_ids` as search. Use sparingly — full bodies cost more tokens.
-
-### You need signatures + callers/callees without source code
-**Tool:** `fetch_node_metadata`
-- Good before edits. Neighbors listed as readable names + cite refs.
-
-### Bare symbol name not already in search results
-**Tool:** `grep_graph_nodes`
-- Pass `terms: ["SymbolName"]` (string array). `grep_terms` is an alias.
-- **Skip** if search already found the symbol under `### Grep:`.
-
-### You already have a `node_id` from search
-**Tool:** `fetch_snippets` or `fetch_node_source` — **not** `grep_graph_nodes`.
-
-### "What files would I touch for this feature?"
-**Tool:** `plan_feature_touch_set`
-- Pass `feature_description` + `grep_terms`. Returns file paths and cite ranges.
-
-### Mentions in tests, docs, markdown (outside the code graph)
-**Tool:** `repo_references`
-
-### Before editing — who depends on this symbol?
-**Tool:** `calculate_blast_radius`
-- Not for discovery — use after you have found the symbol.
-
-### Callers / callees / call flow
-**Tool:** `search_codebase_intent` — read the `#### Call chain` section.
-- Do **not** use deprecated `trace_callers`.
+- **Answer with what you have.** If search + reads already cover the question, stop — do not search or read again.
+- **One search, then read.** Start with a single `search_codebase_intent` call. A second search is allowed **only** when something specific is still missing (wrong anchor, no cite for a symbol you need, gap in the call path).
+- **Read each cite once.** Open only the cite spans you actually need. Skip spans that do not help answer the question.
+- **No overlapping reads.** If two cites cover the same file and ranges overlap, read the union once — never re-read lines you already have in context.
+- **No speculative exploration.** Do not read "just in case", prefetch adjacent files, or widen ranges beyond what the question requires.
+- **Fewest tool calls wins.** Prefer one good search + targeted reads over multiple searches, broad reads, or re-fetching content already in the conversation.
 
 ---
 
-## Reading search output
+## Workflow
+
+1. Call `search_codebase_intent` once with intent queries and any known symbol names.
+2. Read only the cite spans required to answer (format: `startLine:endLine:filepath`). Merge overlapping spans in the same file into one read.
+3. Answer or edit using what you already have — **stop here** if sufficient.
+
+**Second search** — only when a specific gap remains after step 2 (missing symbol, wrong file, incomplete path). Refine queries or symbols; still no grep.
+
+**Never** re-read a cite span or re-run search for information already in context.
+
+---
+
+## Search output
 
 ```markdown
-### Hit 1 — resolve_redirects (0.91)
-node_id: src/foo.py::ClassName.method_name
-cite: `557:653:src/foo.py`
-signature: def resolve_redirects(...)
+## Search
 
-```557:580:src/foo.py
-def resolve_redirects(...):
-    ...
+grep#1:
+resolve_redirects: 557:653:src/foo.py
+Session.send -> resolve_redirects (anchor) -> get_redirect_target
+Session.send: 412:520:src/foo.py
+get_redirect_target: 89:102:src/bar.py
+
+searchQuery#1:
+resolve_redirects: 557:653:src/foo.py
+Session.send -> resolve_redirects (anchor) -> rebuild_method
+Session.send: 412:520:src/foo.py
+rebuild_method: 654:700:src/foo.py
 ```
 
-#### Call chain
-1. Session.send → `412:520:src/foo.py`
-2. **resolve_redirects** (anchor) → `557:653:src/foo.py`
-3. get_redirect_target → `89:102:src/bar.py`
-```
-
-- **Call chain** is query-ranked: upstream callers → anchor → downstream callees.
-- Numbers show execution flow. Cite refs are repo-relative line ranges.
-- Snippet blocks under hits and call chain are ready to paste into your reply.
+- Each `grep#N` and `searchQuery#N` block returns up to **top 2 matches**.\n+- Each match includes an anchor cite, a tiny flow, and caller/callee cites (when present).
 
 ---
 
-## Tool args (inputs — MCP requires structured args)
+## Tool args
 
-### `search_codebase_intent`
 ```
 active_project_root: /abs/path/to/repo
-search_queries: ["intent keywords"]
-grep_terms: ["Session", "resolve_redirects"]
-```
-
-### `fetch_snippets` / `fetch_node_source` / `fetch_node_metadata`
-```
-active_project_root: /abs/path/to/repo
-node_ids: ["src/foo.py::ClassName.method_name"]
-```
-
-### `grep_graph_nodes`
-```
-active_project_root: /abs/path/to/repo
-terms: ["rebuild_method"]
-```
-
-### `plan_feature_touch_set`
-```
-active_project_root: /abs/path/to/repo
-feature_description: add retry on 429
-grep_terms: ["Session", "retry"]
+search_queries: ["intent phrase about the behavior"]
+grep_terms: ["SymbolName", "other_symbol"]
 ```
 
 ---
 
-## Common mistakes
+## Rules
 
-| Wrong | Right |
-|-------|-------|
-| `grep_graph_nodes` with only `active_project_root` | Add `terms: ["symbol"]` |
-| `grep_graph_nodes` when search already has the symbol | Use the `node_id:` from search |
-| `grep_graph_nodes` with a `node_id` in `terms` | Use `fetch_snippets` with that `node_id` |
-| Calling `fetch_snippets` right after search when snippets suffice | Search already includes snippets + call chain |
-| `fetch_node_source` as first read | Search snippets first; escalate only if truncated |
-| `calculate_blast_radius` to find where code lives | Use `search_codebase_intent` |
-| Rebuilding citation fences manually | Copy the fence blocks from tool output |
-| `trace_callers` | Use `search_codebase_intent` call chain |
+**Dos:**
+1. Call `search_codebase_intent` first for any "where/how" question.
+2. One search + only the cite spans you need.
+3. Stop and answer once you have enough context.
+4. Merge overlapping cites in the same file into one read.
+5. Second search only for a **specific missing** symbol or cite.
+6. Use native Read on cite spans.
+7. Retry search with better queries only when a gap remains.
+8. Prefer matches whose tiny flow best matches the question.
+9. Fewest tool calls — answer or edit immediately when ready.
+
+**Don'ts:**
+1. Grep or SemanticSearch to explore the codebase.
+2. Run a second search when the first map already answers the question.
+3. Re-read files or cite spans already in context.
+4. Open the same file twice for overlapping line ranges.
+5. Speculative or "just in case" searches and reads.
+6. Open random files hoping to find code.
+7. Use grep as a fallback.
+8. Rebuild cite strings manually.
+9. Extra exploration after the question is answerable.
 
 ---
 
-## What each tool returns
+## What search returns
 
-- **search**: markdown hits + call chains + citation snippets
-- **fetch_snippets**: citation blocks (line-capped excerpts)
-- **fetch_node_source**: citation blocks (full AST-bound bodies)
-- **grep_graph_nodes**: markdown hit list with cite refs + signatures
-- **fetch_node_metadata**: signatures + caller/callee cite refs (no source)
-- **plan_feature_touch_set**: file paths + cite ranges
-- **repo_references**: `path:line — matched text`
-- **calculate_blast_radius**: upstream dependents list
+- One block per grep term and search query (in order)\n+- Up to 2 matches per block\n+- For each match: anchor cite, tiny caller→anchor→callee flow, and caller/callee cites (when present)
+
+No source code bodies, no node IDs, no snippets — use native Read for content.

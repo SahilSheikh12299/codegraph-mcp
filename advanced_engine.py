@@ -428,6 +428,96 @@ def _grep_fuzzy_rank(term: str, node_id: str, data: Dict[str, Any], case_sensiti
     return (hits / len(tokens)) * 50.0 + float(data.get("call_centrality") or 0)
 
 
+def _expand_symbolic_grep_term(term: str) -> list[tuple[str, float]]:
+    """Expand dotted/qualified symbol strings into weighted sub-terms.
+
+    Goal: keep precision while improving recall for terms like `Session.send` where
+    the code symbol is typically just `send`.
+    """
+    t = (term or "").strip()
+    if not t:
+        return []
+
+    # Default: no expansion.
+    expansions: list[tuple[str, float]] = [(t, 1.0)]
+
+    # Handle dotted / qualified forms.
+    if "." in t or "::" in t:
+        # Normalize separators into dots for tokenization.
+        normalized = t.replace("::", ".")
+        parts = [p for p in normalized.split(".") if p]
+        if len(parts) >= 2:
+            cls, member = parts[-2], parts[-1]
+            # Keep original (highest weight), then add member-only for recall.
+            expansions = [
+                (t, 1.0),
+                (member, 0.85),
+                (f"{cls} {member}", 0.8),
+                (cls, 0.35),
+            ]
+
+    # Deduplicate while preserving best weight.
+    best: dict[str, float] = {}
+    for s, w in expansions:
+        s2 = s.strip()
+        if not s2:
+            continue
+        if s2 not in best or w > best[s2]:
+            best[s2] = w
+    return sorted(best.items(), key=lambda x: x[1], reverse=True)
+
+
+def grep_search_nodes_symbol_aware(
+    G: nx.DiGraph,
+    term: str,
+    *,
+    case_sensitive: bool = False,
+    embedder: Any = None,
+    fuzzy_top_k: int = GREP_FUZZY_TOP_K,
+    affinity_paths: set[str] | None = None,
+    top_k: int = 3,
+) -> List[Dict[str, Any]]:
+    """Symbol-aware grep: expand qualified terms and fuse results.
+
+    This avoids `Session.send` missing the real `send()` method and accidentally
+    preferring `test_*` functions that contain both tokens.
+    """
+    expansions = _expand_symbolic_grep_term(term)
+    if not expansions:
+        return []
+
+    fused: dict[str, Dict[str, Any]] = {}
+    fused_scores: dict[str, float] = {}
+
+    for subterm, weight in expansions:
+        hits = grep_search_nodes(
+            G,
+            subterm,
+            case_sensitive=case_sensitive,
+            embedder=embedder,
+            fuzzy_top_k=fuzzy_top_k,
+            affinity_paths=affinity_paths,
+        )
+        for h in hits:
+            nid = h.get("node_id")
+            if not nid:
+                continue
+            # `grep_search_nodes` provides `score` for both exact and fuzzy.
+            base = float(h.get("score") or 0.0)
+            score = base * weight
+            if nid not in fused_scores or score > fused_scores[nid]:
+                fused_scores[nid] = score
+                fused[nid] = h
+
+    ranked = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)[: max(1, top_k)]
+    out: list[Dict[str, Any]] = []
+    for nid, score in ranked:
+        h = dict(fused[nid])
+        h["score"] = round(score, 4)
+        out.append(h)
+    return out
+
+
 def grep_search_nodes(
     G: nx.DiGraph,
     term: str,
@@ -805,12 +895,35 @@ class AdvancedRetrievalEngine:
         search_queries: List[str],
         grep_terms: List[str] | None = None,
     ) -> dict[str, Any]:
-        """Bucketed retrieval: semantic top-2 + per-grep-term top-(1|3)."""
+        """Bucketed retrieval.
+
+        Returns:
+        - semantic_by_query: top semantic candidates per individual query (preferred for term-scoped UX)
+        - semantic_bucket: legacy pooled semantic candidates across all queries (kept for compatibility)
+        - grep_buckets: per-grep-term candidates
+        """
         grep_terms = [t.strip() for t in (grep_terms or []) if t and t.strip()]
         queries = [q.strip() for q in search_queries if q and q.strip()]
 
-        semantic_nodes: list[dict[str, Any]] = []
+        semantic_by_query: list[dict[str, Any]] = []
+        semantic_nodes: list[dict[str, Any]] = []  # legacy pooled bucket
         if queries:
+            # Per-query semantic hits (top-K per query).
+            for q in queries:
+                q_hits = self.run_hybrid_retrieval([q], keywords=[])
+                q_nodes: list[dict[str, Any]] = []
+                for hit in q_hits[:BUCKET_SEMANTIC_TOP_K]:
+                    q_nodes.append(
+                        format_search_candidate(
+                            self.G,
+                            hit["node_id"],
+                            hit["metadata"],
+                            score=hit["hybrid_score"],
+                        )
+                    )
+                semantic_by_query.append({"query": q, "nodes": q_nodes})
+
+            # Legacy pooled semantic hits across the full query list.
             query_hits = self.run_hybrid_retrieval(queries, keywords=[])
             for hit in query_hits[:BUCKET_SEMANTIC_TOP_K]:
                 semantic_nodes.append(
@@ -826,11 +939,13 @@ class AdvancedRetrievalEngine:
 
         grep_buckets: list[dict[str, Any]] = []
         for term in grep_terms:
-            nodes = grep_search_nodes(
+            # Symbol-aware expansion helps with qualified terms like `Session.send`.
+            nodes = grep_search_nodes_symbol_aware(
                 self.G,
                 term,
                 embedder=self.embedder,
                 affinity_paths=affinity_paths or None,
+                top_k=max(GREP_FUZZY_TOP_K, 3),
             )
             grep_buckets.append({
                 "term": term,
@@ -841,6 +956,7 @@ class AdvancedRetrievalEngine:
         return {
             "rewritten_queries": queries,
             "grep_terms": grep_terms,
+            "semantic_by_query": semantic_by_query,
             "semantic_bucket": {"nodes": semantic_nodes},
             "grep_buckets": grep_buckets,
         }

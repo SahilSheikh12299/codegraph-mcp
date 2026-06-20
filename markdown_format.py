@@ -1,8 +1,8 @@
-"""Cursor-native markdown formatters for GraphRAG MCP tool output."""
+"""Cursor-native markdown formatters for GraphRAG MCP search output."""
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 
 def short_name(node_id: str) -> str:
@@ -20,18 +20,6 @@ def cite_ref(file_path: str | None, start: int | None, end: int | None) -> str:
     return f"{start}:{end}:{file_path}"
 
 
-def cursor_citation(
-    file_path: str | None,
-    start: int | None,
-    end: int | None,
-    code: str,
-) -> str:
-    ref = cite_ref(file_path, start, end)
-    if not ref or not code:
-        return ""
-    return f"```{ref}\n{code.rstrip()}\n```"
-
-
 def format_error(message: str, example: str = "") -> str:
     lines = [f"## Error\n\n{message}"]
     if example:
@@ -43,286 +31,155 @@ def _display_name(entry: dict[str, Any]) -> str:
     return entry.get("name") or short_name(entry.get("node_id", ""))
 
 
-def format_call_chain(
-    chain: list[dict[str, Any]],
+def _role_label(name: str, role: str) -> str:
+    if role == "anchor":
+        return f"**{name}** (anchor)"
+    if role == "caller":
+        return f"{name} (caller)"
+    if role == "callee":
+        return f"{name} (callee)"
+    if role == "downstream":
+        return f"{name} (downstream)"
+    return name
+
+
+def format_micro_search_markdown(
     *,
-    snippet_loader: Callable[[str], str | None] | None = None,
+    queries: list[str],
+    grep_terms: list[str],
+    anchor: dict[str, Any] | None,
+    path: list[dict[str, Any]],
+    read_next: list[str],
 ) -> str:
-    if not chain:
-        return ""
-    lines = ["#### Call chain"]
-    step = 0
-    for entry in chain:
-        step += 1
-        name = _display_name(entry)
-        ref = cite_ref(entry.get("file_path"), entry.get("start_line"), entry.get("end_line"))
-        role = entry.get("role", "")
-        if role == "anchor":
-            label = f"**{name}** (anchor)"
-        else:
-            label = name
-        lines.append(f"{step}. {label} → `{ref}`")
-
-    if snippet_loader:
-        seen: set[str] = set()
-        for entry in chain:
-            nid = entry.get("node_id")
-            if not nid or nid in seen:
-                continue
-            seen.add(nid)
-            snippet = snippet_loader(nid)
-            if snippet:
-                lines.append("")
-                lines.append(snippet)
-
-    return "\n".join(lines)
-
-
-def format_search_markdown(
-    result: dict[str, Any],
-    *,
-    call_chains: dict[str, list[dict[str, Any]]],
-    snippet_loader: Callable[[str], str | None] | None = None,
-) -> str:
-    queries = result.get("rewritten_queries") or []
-    grep_terms = result.get("grep_terms") or []
-    semantic_nodes = (result.get("semantic_bucket") or {}).get("nodes") or []
-    grep_buckets = result.get("grep_buckets") or []
-
-    if not semantic_nodes and not any(b.get("nodes") for b in grep_buckets):
+    """Micro search: 1 anchor + ordered path + up to 3 read-next cite spans."""
+    if not anchor:
         q = ", ".join(queries) if queries else "(none)"
-        return f"## Search\n\nNo graph matches for: {q}"
+        terms = ", ".join(grep_terms) if grep_terms else ""
+        hint = f" and symbols: {terms}" if terms else ""
+        return (
+            f"## Search\n\n"
+            f"No graph matches for: {q}{hint}\n\n"
+            f"Refine `search_queries` or `grep_terms` and call search again."
+        )
 
     lines = ["## Search", ""]
     if queries:
         lines.append(f"Queries: {', '.join(queries)}")
     if grep_terms:
-        lines.append(f"Grep: {', '.join(grep_terms)}")
+        lines.append(f"Symbols: {', '.join(grep_terms)}")
     lines.append("")
 
-    for idx, node in enumerate(semantic_nodes, 1):
-        name = _display_name(node)
-        score = node.get("score")
-        score_s = f" ({score})" if score is not None else ""
-        ref = cite_ref(node.get("file_path"), node.get("start_line"), node.get("end_line"))
-        lines.append(f"### Hit {idx} — {name}{score_s}")
-        lines.append(f"node_id: {node.get('node_id')}")
-        if ref:
-            lines.append(f"cite: `{ref}`")
-        sig = (node.get("signature") or "").strip()
-        if sig:
-            lines.append(f"signature: {sig}")
+    name = _display_name(anchor)
+    ref = cite_ref(anchor.get("file_path"), anchor.get("start_line"), anchor.get("end_line"))
+    lines.append("### Anchor")
+    lines.append(f"- {name} — `{ref}`")
+    sig = (anchor.get("signature") or "").strip()
+    if sig:
+        lines.append(f"- signature: {sig}")
+    lines.append("")
 
-        if snippet_loader and node.get("node_id"):
-            snippet = snippet_loader(node["node_id"])
-            if snippet:
-                lines.append("")
-                lines.append(snippet)
-
-        nid = node.get("node_id")
-        if nid and nid in call_chains:
-            chain_md = format_call_chain(
-                call_chains[nid],
-                snippet_loader=snippet_loader,
+    lines.append("### Path")
+    if path:
+        for idx, step in enumerate(path, 1):
+            step_name = _display_name(step)
+            step_ref = cite_ref(
+                step.get("file_path"), step.get("start_line"), step.get("end_line")
             )
-            if chain_md:
-                lines.append("")
-                lines.append(chain_md)
-        lines.append("")
+            label = _role_label(step_name, step.get("role", ""))
+            lines.append(f"{idx}. {label} → `{step_ref}`")
+    else:
+        lines.append(f"1. {_role_label(name, 'anchor')} → `{ref}`")
+    lines.append("")
 
-    for bucket in grep_buckets:
-        term = bucket.get("term", "")
-        mode = bucket.get("match_mode", "none")
-        nodes = bucket.get("nodes") or []
-        lines.append(f"### Grep: {term} ({mode})")
-        if not nodes:
-            lines.append("- (no matches)")
-        for node in nodes:
-            name = _display_name(node)
-            ref = cite_ref(node.get("file_path"), node.get("start_line"), node.get("end_line"))
-            sig = (node.get("signature") or "").strip()
-            sig_part = f" — {sig}" if sig else ""
-            lines.append(f"- {name} — `{ref}`{sig_part}")
-            lines.append(f"  node_id: {node.get('node_id')}")
-        lines.append("")
+    lines.append("### Read next")
+    if read_next:
+        for idx, span in enumerate(read_next, 1):
+            lines.append(f"{idx}. `{span}`")
+    else:
+        lines.append(f"1. `{ref}`")
 
     return "\n".join(lines).rstrip()
 
 
-def format_grep_markdown(buckets: list[dict[str, Any]], terms: list[str]) -> str:
-    lines = ["## Grep Graph Results", ""]
-    if terms:
-        lines.append(f"Terms: {', '.join(terms)}")
-        lines.append("")
-    for bucket in buckets:
-        term = bucket.get("term", "")
-        mode = bucket.get("match_mode", "none")
-        nodes = bucket.get("nodes") or []
-        lines.append(f"### {term} ({mode})")
-        if not nodes:
-            lines.append("- (no matches)")
-        for node in nodes:
-            name = _display_name(node)
-            ref = cite_ref(node.get("file_path"), node.get("start_line"), node.get("end_line"))
-            sig = (node.get("signature") or "").strip()
-            sig_part = f" — {sig}" if sig else ""
-            lines.append(f"- {name} — `{ref}`{sig_part}")
-            lines.append(f"  node_id: {node.get('node_id')}")
-        lines.append("")
-    return "\n".join(lines).rstrip()
+def _chain_pick(chain: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    caller = next((s for s in chain if s.get("role") == "caller"), None)
+    anchor = next((s for s in chain if s.get("role") == "anchor"), None)
+    callee = next((s for s in chain if s.get("role") == "callee"), None)
+    return caller, anchor, callee
 
 
-def format_snippets_markdown(nodes: list[dict[str, Any]]) -> str:
-    if not nodes:
-        return "## Snippets\n\n(no nodes)"
-    parts = ["## Snippets"]
-    for node in nodes:
-        if node.get("error"):
-            parts.append(f"\n### {node.get('node_id', '?')}\n{node['error']}")
-            continue
-        name = _display_name(node)
-        ref = cite_ref(node.get("file_path"), node.get("start_line"), node.get("end_line"))
-        trunc = " (truncated)" if node.get("truncated") else ""
-        parts.append(f"\n### {name}{trunc}")
-        parts.append(f"node_id: {node.get('node_id')}")
-        block = cursor_citation(
-            node.get("file_path"),
-            node.get("start_line"),
-            node.get("end_line"),
-            node.get("snippet") or "",
-        )
-        if block:
-            parts.append(block)
-    return "\n".join(parts)
+def _ref_for(entry: dict[str, Any] | None) -> str:
+    if not entry:
+        return ""
+    return cite_ref(entry.get("file_path"), entry.get("start_line"), entry.get("end_line"))
 
 
-def format_source_markdown(nodes: list[dict[str, Any]]) -> str:
-    if not nodes:
-        return "## Source\n\n(no nodes)"
-    parts = ["## Source"]
-    for node in nodes:
-        if node.get("error"):
-            parts.append(f"\n### {node.get('node_id', '?')}\n{node['error']}")
-            continue
-        name = _display_name(node)
-        parts.append(f"\n### {name}")
-        parts.append(f"node_id: {node.get('node_id')}")
-        block = cursor_citation(
-            node.get("file_path"),
-            node.get("start_line"),
-            node.get("end_line"),
-            node.get("source") or "",
-        )
-        if block:
-            parts.append(block)
-    return "\n".join(parts)
-
-
-def _neighbor_line(G: Any, nid: str) -> str:
-    if G is not None and G.has_node(nid):
-        data = G.nodes[nid]
-        start, end = None, None
-        span = data.get("line_span")
-        if span and len(span) >= 2:
-            start, end = int(span[0]), int(span[1])
-        fp = data.get("file_path")
-        name = data.get("name") or short_name(nid)
-        ref = cite_ref(fp, start, end)
-        return f"{name} — `{ref}`"
-    return f"{short_name(nid)} — `{nid}`"
-
-
-def format_metadata_markdown(nodes: list[dict[str, Any]], G: Any = None) -> str:
-    if not nodes:
-        return "## Node Metadata\n\n(no nodes)"
-    lines = ["## Node Metadata", ""]
-    for node in nodes:
-        if node.get("error"):
-            lines.append(f"- {node.get('node_id')}: {node['error']}")
-            continue
-        name = _display_name(node)
-        ref = cite_ref(node.get("file_path"), node.get("start_line"), node.get("end_line"))
-        lines.append(f"### {name}")
-        lines.append(f"node_id: {node.get('node_id')}")
-        lines.append(f"cite: `{ref}`")
-        sig = (node.get("signature") or "").strip()
-        if sig:
-            lines.append(f"signature: {sig}")
-        nb = node.get("neighbors") or {}
-        callers = (nb.get("callers") or [])[:5]
-        callees = (nb.get("callees") or [])[:5]
-        if callers:
-            lines.append("callers:")
-            for i, cid in enumerate(callers, 1):
-                lines.append(f"  {i}. {_neighbor_line(G, cid)}")
-        if callees:
-            lines.append("callees:")
-            for i, cid in enumerate(callees, 1):
-                lines.append(f"  {i}. {_neighbor_line(G, cid)}")
-        lines.append("")
-    return "\n".join(lines).rstrip()
-
-
-def format_touch_set_markdown(
-    feature_description: str,
-    required: list[dict[str, Any]],
-    related: list[dict[str, Any]],
-    non_graph_refs: list[dict[str, Any]],
+def format_multi_term_paths_markdown(
+    *,
+    grep_results: list[dict[str, Any]],
+    search_results: list[dict[str, Any]],
 ) -> str:
-    lines = [f"## Touch set: {feature_description}", "", "### Required"]
-    if not required:
-        lines.append("- (none)")
-    for item in required:
-        fp = item.get("file_path", "")
-        ranges = item.get("line_ranges") or []
-        if ranges:
-            range_strs = [
-                cite_ref(fp, r[0], r[1]) if len(r) >= 2 else fp for r in ranges
-            ]
-            lines.append(f"- `{fp}` — {', '.join(f'`{s}`' for s in range_strs if s)}")
-        else:
-            lines.append(f"- `{fp}`")
-    lines.extend(["", "### Related"])
-    if not related:
-        lines.append("- (none)")
-    for item in related:
-        fp = item.get("file_path", "")
-        lines.append(f"- `{fp}`")
-    lines.extend(["", "### Non-graph refs"])
-    if not non_graph_refs:
-        lines.append("- (none)")
-    for hit in non_graph_refs[:20]:
-        lines.append(f"- `{hit.get('file_path')}`:{hit.get('line')} — {hit.get('text', '')}")
-    return "\n".join(lines)
+    """Minimal, term-scoped output: top matches + tiny caller→anchor→callee flow.
+
+    Expected output blocks:
+    - grep#N: ... (top 2 matches)
+    - searchQuery#N: ... (top 2 matches)
+    """
+    lines: list[str] = ["## Search", ""]
+
+    def _emit_block(label: str, matches: list[dict[str, Any]]) -> None:
+        lines.append(f"{label}:")
+        if not matches:
+            lines.append("(no matches)")
+            lines.append("")
+            return
+
+        for match in matches:
+            anchor = match.get("anchor") or {}
+            chain = match.get("chain") or []
+            caller_step, anchor_step, callee_step = _chain_pick(chain)
+
+            anchor_name = _display_name(anchor_step or anchor)
+            anchor_ref = _ref_for(anchor_step) or cite_ref(
+                anchor.get("file_path"), anchor.get("start_line"), anchor.get("end_line")
+            )
+            lines.append(f"{anchor_name}: {anchor_ref}")
+
+            caller_name = _display_name(caller_step) if caller_step else ""
+            callee_name = _display_name(callee_step) if callee_step else ""
+            if caller_name and callee_name:
+                lines.append(f"{caller_name} -> {anchor_name} (anchor) -> {callee_name}")
+            elif caller_name:
+                lines.append(f"{caller_name} -> {anchor_name} (anchor)")
+            elif callee_name:
+                lines.append(f"{anchor_name} (anchor) -> {callee_name}")
+            else:
+                lines.append(f"{anchor_name} (anchor)")
+
+            if caller_step:
+                lines.append(f"{caller_name}: {_ref_for(caller_step)}")
+            if callee_step:
+                lines.append(f"{callee_name}: {_ref_for(callee_step)}")
+            lines.append("")
+
+    for idx, bucket in enumerate(grep_results or [], 1):
+        _emit_block(f"grep#{idx}", (bucket.get("matches") or [])[:2])
+
+    for idx, bucket in enumerate(search_results or [], 1):
+        _emit_block(f"searchQuery#{idx}", (bucket.get("matches") or [])[:2])
+
+    return "\n".join(lines).rstrip()
 
 
-def format_repo_refs_markdown(hits: list[dict[str, Any]], terms: list[str] | None = None) -> str:
-    lines = ["## Repo References", ""]
-    if terms:
-        lines.append(f"Terms: {', '.join(terms)}")
-        lines.append("")
-    if not hits:
-        lines.append("(no matches)")
-        return "\n".join(lines)
-    for hit in hits:
-        lines.append(f"- `{hit.get('file_path')}`:{hit.get('line')} — {hit.get('text', '')}")
-    return "\n".join(lines)
-
-
-def format_blast_radius_markdown(target_symbol: str, items: list[dict[str, Any]], total: int, max_items: int) -> str:
-    lines = [
-        f"## Upstream dependents: `{target_symbol}`",
-        f"",
-        f"Modifying this symbol may affect **{total}** graph element(s).",
-        "",
-    ]
-    shown = items[:max_items]
-    for item in shown:
-        fp = item.get("file_path") or ""
-        nid = item.get("node_id") or ""
-        typ = item.get("type") or ""
-        lines.append(f"- [{typ}] {short_name(nid)} — `{fp}`")
-    more = total - len(shown)
-    if more > 0:
-        lines.append(f"\n... and {more} more.")
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# Legacy formatters (unused — kept for reference)
+# ---------------------------------------------------------------------------
+# def cursor_citation(...): ...
+# def format_search_markdown(...): ...
+# def format_grep_markdown(...): ...
+# def format_snippets_markdown(...): ...
+# def format_source_markdown(...): ...
+# def format_metadata_markdown(...): ...
+# def format_touch_set_markdown(...): ...
+# def format_repo_refs_markdown(...): ...
+# def format_blast_radius_markdown(...): ...
