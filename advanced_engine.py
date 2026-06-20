@@ -534,7 +534,7 @@ def grep_search_nodes(
 
     literal_hits: list[tuple[str, Dict[str, Any], float]] = []
     for node_id, data in G.nodes(data=True):
-        if data.get("type") not in ("CLASS", "FUNCTION", "CONSTANT"):
+        if data.get("type") not in ("CLASS", "FUNCTION"):
             continue
         grep_text = data.get("grep_text") or build_grep_text(data)
         hay = grep_text if case_sensitive else grep_text.lower()
@@ -559,7 +559,7 @@ def grep_search_nodes(
         term_vec = embedder.model.encode(term, convert_to_numpy=True).tolist()
 
     for node_id, data in G.nodes(data=True):
-        if data.get("type") not in ("CLASS", "FUNCTION", "CONSTANT"):
+        if data.get("type") not in ("CLASS", "FUNCTION"):
             continue
         score = _grep_fuzzy_rank(term, node_id, data, case_sensitive)
         name_emb = data.get("name_embedding")

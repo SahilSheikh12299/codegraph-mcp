@@ -114,6 +114,63 @@ def _ref_for(entry: dict[str, Any] | None) -> str:
     return cite_ref(entry.get("file_path"), entry.get("start_line"), entry.get("end_line"))
 
 
+def _format_match_lines(
+    match: dict[str, Any],
+    *,
+    seen_refs: set[str],
+    seen_flows: set[str],
+) -> list[str]:
+    """Format one match, skipping cite refs and flows already emitted earlier."""
+    anchor = match.get("anchor") or {}
+    chain = match.get("chain") or []
+    caller_step, anchor_step, callee_step = _chain_pick(chain)
+
+    anchor_name = _display_name(anchor_step or anchor)
+    anchor_ref = _ref_for(anchor_step) or cite_ref(
+        anchor.get("file_path"), anchor.get("start_line"), anchor.get("end_line")
+    )
+
+    lines: list[str] = []
+    emitted_anchor_cite = False
+    if anchor_ref and anchor_ref not in seen_refs:
+        lines.append(f"{anchor_name}: {anchor_ref}")
+        seen_refs.add(anchor_ref)
+        emitted_anchor_cite = True
+
+    caller_name = _display_name(caller_step) if caller_step else ""
+    callee_name = _display_name(callee_step) if callee_step else ""
+    if caller_name and callee_name:
+        flow = f"{caller_name} -> {anchor_name} (anchor) -> {callee_name}"
+    elif caller_name:
+        flow = f"{caller_name} -> {anchor_name} (anchor)"
+    elif callee_name:
+        flow = f"{anchor_name} (anchor) -> {callee_name}"
+    else:
+        flow = f"{anchor_name} (anchor)"
+
+    has_chain_context = bool(caller_name or callee_name)
+    if has_chain_context:
+        if flow not in seen_flows:
+            lines.append(flow)
+            seen_flows.add(flow)
+    elif emitted_anchor_cite and flow not in seen_flows:
+        lines.append(flow)
+        seen_flows.add(flow)
+
+    if caller_step:
+        caller_ref = _ref_for(caller_step)
+        if caller_ref and caller_ref not in seen_refs:
+            lines.append(f"{caller_name}: {caller_ref}")
+            seen_refs.add(caller_ref)
+    if callee_step:
+        callee_ref = _ref_for(callee_step)
+        if callee_ref and callee_ref not in seen_refs:
+            lines.append(f"{callee_name}: {callee_ref}")
+            seen_refs.add(callee_ref)
+
+    return lines
+
+
 def format_multi_term_paths_markdown(
     *,
     grep_results: list[dict[str, Any]],
@@ -126,41 +183,29 @@ def format_multi_term_paths_markdown(
     - searchQuery#N: ... (top 2 matches)
     """
     lines: list[str] = ["## Search", ""]
+    seen_refs: set[str] = set()
+    seen_flows: set[str] = set()
 
     def _emit_block(label: str, matches: list[dict[str, Any]]) -> None:
-        lines.append(f"{label}:")
-        if not matches:
+        block_lines: list[str] = []
+        for match in matches:
+            match_lines = _format_match_lines(
+                match, seen_refs=seen_refs, seen_flows=seen_flows
+            )
+            if match_lines:
+                block_lines.extend(match_lines)
+                block_lines.append("")
+
+        if not block_lines and not matches:
+            lines.append(f"{label}:")
             lines.append("(no matches)")
             lines.append("")
             return
+        if not block_lines:
+            return
 
-        for match in matches:
-            anchor = match.get("anchor") or {}
-            chain = match.get("chain") or []
-            caller_step, anchor_step, callee_step = _chain_pick(chain)
-
-            anchor_name = _display_name(anchor_step or anchor)
-            anchor_ref = _ref_for(anchor_step) or cite_ref(
-                anchor.get("file_path"), anchor.get("start_line"), anchor.get("end_line")
-            )
-            lines.append(f"{anchor_name}: {anchor_ref}")
-
-            caller_name = _display_name(caller_step) if caller_step else ""
-            callee_name = _display_name(callee_step) if callee_step else ""
-            if caller_name and callee_name:
-                lines.append(f"{caller_name} -> {anchor_name} (anchor) -> {callee_name}")
-            elif caller_name:
-                lines.append(f"{caller_name} -> {anchor_name} (anchor)")
-            elif callee_name:
-                lines.append(f"{anchor_name} (anchor) -> {callee_name}")
-            else:
-                lines.append(f"{anchor_name} (anchor)")
-
-            if caller_step:
-                lines.append(f"{caller_name}: {_ref_for(caller_step)}")
-            if callee_step:
-                lines.append(f"{callee_name}: {_ref_for(callee_step)}")
-            lines.append("")
+        lines.append(f"{label}:")
+        lines.extend(block_lines)
 
     for idx, bucket in enumerate(grep_results or [], 1):
         _emit_block(f"grep#{idx}", (bucket.get("matches") or [])[:2])

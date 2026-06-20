@@ -443,6 +443,7 @@ def extract_file_entities(
     class RepoASTVisitor(ast.NodeVisitor):
         def __init__(self):
             self.current_class = None
+            self.current_function = None
             
         def visit_ClassDef(self, node):
             node_id = f"{rel_path}::{node.name}"
@@ -515,12 +516,15 @@ def extract_file_entities(
                     belongs_to_class=self.current_class,
                 ),
             }
+            old_function = self.current_function
+            self.current_function = node.name
             self.generic_visit(node)
+            self.current_function = old_function
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_Assign(self, node):
-            if self.current_class is not None:
+            if self.current_class is not None or self.current_function is not None:
                 return
             for target in node.targets:
                 if not isinstance(target, ast.Name):
