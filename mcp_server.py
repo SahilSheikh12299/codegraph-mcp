@@ -4,7 +4,8 @@ import sys
 import gc
 import logging
 import hashlib
-import json
+import subprocess
+import time
 from pathlib import Path
 import networkx as nx
 from mcp.server.fastmcp import FastMCP
@@ -27,7 +28,21 @@ from advanced_engine import (
     recompute_call_centrality,
     build_grep_text,
     grep_search_nodes,
+    extract_source_excerpt,
+    build_query_ranked_call_chain,
     NEIGHBOR_ID_LIMIT,
+)
+from markdown_format import (
+    cursor_citation,
+    format_error,
+    format_search_markdown,
+    format_grep_markdown,
+    format_snippets_markdown,
+    format_source_markdown,
+    format_metadata_markdown,
+    format_touch_set_markdown,
+    format_repo_refs_markdown,
+    format_blast_radius_markdown,
 )
 from buildGraph import (
     wire_calls_for_file,
@@ -48,7 +63,47 @@ mcp = FastMCP("Cursor-Graph-RAG-Engine")
 
 model_manager = EmbeddingModelLifecycleManager()
 
+_NODE_CACHE_TTL_SEC = 1800
+_NODE_CACHE_MAX = 500
+_node_payload_cache: dict[tuple, tuple[float, dict[str, Any]]] = {}
 
+_DEFAULT_REPO_REF_GLOBS = [
+    "tests/**",
+    "test/**",
+    "docs/**",
+    "doc/**",
+    "**/*.md",
+    "**/*.rst",
+    "HISTORY.*",
+    "CHANGELOG.*",
+]
+
+
+def _cache_get(key: tuple) -> dict[str, Any] | None:
+    entry = _node_payload_cache.get(key)
+    if not entry:
+        return None
+    ts, payload = entry
+    if time.time() - ts > _NODE_CACHE_TTL_SEC:
+        _node_payload_cache.pop(key, None)
+        return None
+    return payload
+
+
+def _cache_set(key: tuple, payload: dict[str, Any]) -> None:
+    if len(_node_payload_cache) >= _NODE_CACHE_MAX:
+        oldest_key = min(_node_payload_cache, key=lambda k: _node_payload_cache[k][0])
+        _node_payload_cache.pop(oldest_key, None)
+    _node_payload_cache[key] = (time.time(), payload)
+
+
+def _is_hollow_constant_source(source: str) -> bool:
+    s = (source or "").strip()
+    if not s:
+        return True
+    if s.startswith("Entity Type: CONSTANT"):
+        return True
+    return _is_stub_source(s)
 
 def _is_stub_source(source: str) -> bool:
     s = source.strip()
@@ -70,6 +125,36 @@ def _source_completeness_fields(source: str) -> dict[str, Any]:
         "line_count": len(lines),
         "source_kind": "ast_bound_full_body",
     }
+
+
+def _to_snippet_payload(payload: dict[str, Any], max_lines: int) -> dict[str, Any]:
+    """Trim a full node payload to a line-capped excerpt for skim / edit context."""
+    if payload.get("error"):
+        return payload
+    full_source = (payload.get("source") or "").strip()
+    node_type = payload.get("type", "FUNCTION")
+    lines = full_source.splitlines()
+    cap = max(1, int(max_lines))
+    excerpt = extract_source_excerpt(full_source, node_type, max_lines=cap)
+    truncated = len(lines) > cap or "# ... truncated" in excerpt
+    out: dict[str, Any] = {
+        "node_id": payload["node_id"],
+        "type": node_type,
+        "file_path": payload.get("file_path"),
+        "name": payload.get("name"),
+        "signature": payload.get("signature", ""),
+        "start_line": payload.get("start_line"),
+        "end_line": payload.get("end_line"),
+        "snippet": excerpt,
+        "line_count": len(lines),
+        "truncated": truncated,
+        "source_complete": not truncated,
+        "source_kind": "ast_bound_excerpt",
+        "max_lines": cap,
+    }
+    if payload.get("resolved_stub_from"):
+        out["resolved_stub_from"] = payload["resolved_stub_from"]
+    return out
 
 
 def _constant_fallback(workspace_root: Path, node_id: str) -> dict[str, Any] | None:
@@ -125,8 +210,64 @@ def _find_impl_alternate(G: nx.DiGraph, node_id: str, node_data: dict) -> str | 
 #     return f"\n\n### Graph neighbors\n{neighbors}"
 
 
-def _json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+def _make_snippet_loader(
+    G: nx.DiGraph,
+    workspace_root: Path,
+    max_lines: int,
+) -> Any:
+    """Return a node_id -> cursor citation block loader."""
+    cache: dict[str, str] = {}
+
+    def load(node_id: str) -> str | None:
+        if node_id in cache:
+            return cache[node_id] or None
+        payload = _build_node_payload(
+            G, node_id, workspace_root=workspace_root, include_neighbors=False
+        )
+        if payload.get("error"):
+            cache[node_id] = ""
+            return None
+        snippet = _to_snippet_payload(payload, max_lines)
+        block = cursor_citation(
+            snippet.get("file_path"),
+            snippet.get("start_line"),
+            snippet.get("end_line"),
+            snippet.get("snippet") or "",
+        )
+        cache[node_id] = block
+        return block or None
+
+    return load
+
+
+def _coerce_term_list(value: list[str] | str | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    out: list[str] = []
+    for item in value:
+        if item is None:
+            continue
+        stripped = str(item).strip()
+        if stripped:
+            out.append(stripped)
+    return out
+
+
+def _resolve_grep_term_args(
+    terms: list[str] | None,
+    grep_terms: list[str] | None,
+) -> list[str]:
+    """Merge terms + grep_terms (search alias); dedupe preserving order."""
+    seen: set[str] = set()
+    merged: list[str] = []
+    for term in _coerce_term_list(terms) + _coerce_term_list(grep_terms):
+        if term not in seen:
+            seen.add(term)
+            merged.append(term)
+    return merged
 
 
 # def _get_capped_call_neighbors(G: nx.DiGraph, node_id: str, neighbors_max: int) -> dict:
@@ -509,20 +650,19 @@ def search_codebase_intent(
     search_queries: list[str],
     active_project_root: str,
     grep_terms: list[str] | None = None,
-    # targeted_symbols: list[str] = None,
-    top_k: int = 8,
-    format: str = "json",
-    include_next_action: bool = True,
+    include_snippets: bool = True,
+    snippet_max_lines: int = 25,
 ) -> str:
-    """Find code by intent. With grep_terms, returns bucketed semantic + grep results (no source excerpts).
+    """Find code by intent. Returns markdown with hits, call chains, and citation blocks.
+
+    Pass grep_terms whenever you have symbol names. Snippets are included by default.
 
     Args:
         search_queries: LLM-rewritten intent queries for semantic search.
         active_project_root: Absolute path to the repo root.
-        grep_terms: Literal grep-style terms from the LLM (use instead of native grep).
-        top_k: Max candidates for legacy non-bucketed mode (top 2 include source_excerpt).
-        format: "json" (default) or "markdown".
-        include_next_action: If true, suggest fetch_node_source for drill-down.
+        grep_terms: Literal symbol names for graph grep buckets.
+        include_snippets: Include line-capped citation blocks for hits and call chain.
+        snippet_max_lines: Max lines per inline snippet (default 25).
     """
     workspace_root = Path(active_project_root).resolve()
     graph_path, lock_path = get_graph_paths(workspace_root)
@@ -540,17 +680,32 @@ def search_codebase_intent(
             embedder_instance=embedder,
             reranker=reranker,
         )
-        if grep_terms:
-            return engine.compile_bucketed_context_package(
-                search_queries=search_queries,
-                grep_terms=grep_terms,
-                include_next_action=include_next_action,
-            )
-        return engine.compile_context_package(
+        result = engine.compile_bucketed_context_package(
             search_queries=search_queries,
-            top_k=top_k,
-            output_format=format,
-            include_next_action=include_next_action,
+            grep_terms=grep_terms or [],
+        )
+        queries = result.get("rewritten_queries") or []
+        call_chains: dict[str, list[dict[str, Any]]] = {}
+        for node in (result.get("semantic_bucket") or {}).get("nodes", []):
+            nid = node.get("node_id")
+            if nid:
+                call_chains[nid] = build_query_ranked_call_chain(
+                    G,
+                    nid,
+                    queries,
+                    embedder=embedder,
+                    reranker=reranker,
+                )
+
+        snippet_loader = (
+            _make_snippet_loader(G, workspace_root, snippet_max_lines)
+            if include_snippets
+            else None
+        )
+        return format_search_markdown(
+            result,
+            call_chains=call_chains,
+            snippet_loader=snippet_loader,
         )
     finally:
         model_manager.release()
@@ -558,24 +713,36 @@ def search_codebase_intent(
 
 @mcp.tool()
 def grep_graph_nodes(
-    terms: list[str],
     active_project_root: str,
+    terms: list[str] | None = None,
+    grep_terms: list[str] | None = None,
     case_sensitive: bool = False,
     max_hits_per_term: int = 3,
-    format: str = "json",
 ) -> str:
-    """Grep-replica over graph node text. Use instead of native grep for exact-string certainty.
+    """Graph symbol lookup: exact match metadata only (no neighbors, no source).
 
     Literal match returns top 1 per term; fuzzy fallback returns up to max_hits_per_term.
-    Each hit includes embedding_text + 5 callers/callees. Use fetch_node_source for full code.
+    Use for bare symbol names (e.g. \"rebuild_method\"). If you already have a node_id
+    from search, use fetch_snippets instead — do not call this tool.
 
-    Args:
-        terms: Literal search strings (same as grep patterns the LLM would use).
+    Required args:
         active_project_root: Absolute path to the repo root.
-        case_sensitive: Match case exactly when true.
-        max_hits_per_term: Cap for fuzzy mode (exact mode always returns 1).
+        terms: Non-empty list of literal symbol strings, e.g. [\"Session.get\", \"rebuild_method\"].
+        grep_terms: Alias for terms (same as search_codebase_intent); either terms or grep_terms required.
     """
     workspace_root = Path(active_project_root).resolve()
+    resolved_terms = _resolve_grep_term_args(terms, grep_terms)
+    if not resolved_terms:
+        return format_error(
+            "grep_graph_nodes requires terms: [\"SymbolName\", ...] "
+            "(grep_terms is also accepted). "
+            "If you have a node_id from search, use fetch_snippets with node_ids instead.",
+            example=(
+                f'active_project_root: "{workspace_root}"\n'
+                'terms: ["rebuild_method"]'
+            ),
+        )
+
     graph_path, lock_path = get_graph_paths(workspace_root)
 
     embedder = model_manager.acquire()
@@ -586,8 +753,7 @@ def grep_graph_nodes(
                 GraphSerializer.save_to_json(G, workspace_root, graph_path)
 
         buckets: list[dict[str, Any]] = []
-        all_ids: list[str] = []
-        for term in terms:
+        for term in resolved_terms:
             term = (term or "").strip()
             if not term:
                 continue
@@ -598,29 +764,13 @@ def grep_graph_nodes(
                 embedder=embedder,
                 fuzzy_top_k=max(1, int(max_hits_per_term)),
             )
-            all_ids.extend(n["node_id"] for n in nodes)
             buckets.append({
                 "term": term,
                 "match_mode": nodes[0]["match_mode"] if nodes else "none",
                 "nodes": nodes,
             })
 
-        out: dict[str, Any] = {"terms": terms, "buckets": buckets}
-        if all_ids:
-            out["next_action"] = {
-                "tool": "fetch_node_source",
-                "args": {"node_ids": all_ids[:3]},
-            }
-        if format == "json":
-            return _json_dumps(out)
-        lines = ["## Grep Graph Results\n"]
-        for bucket in buckets:
-            lines.append(f"### Term: `{bucket['term']}` ({bucket['match_mode']})")
-            for node in bucket.get("nodes", []):
-                lines.append(f"- `{node['node_id']}` | {node.get('signature', '')}")
-                nb = node.get("neighbors") or {}
-                lines.append(f"  callers: {len(nb.get('callers', []))}, callees: {len(nb.get('callees', []))}")
-        return "\n".join(lines)
+        return format_grep_markdown(buckets, resolved_terms)
     finally:
         model_manager.release()
 
@@ -629,7 +779,6 @@ def grep_graph_nodes(
 def calculate_blast_radius(
     target_symbol: str,
     active_project_root: str,
-    format: str = "markdown",
     max_items: int = 50,
 ) -> str:
     """List upstream dependents before editing code. Not for discovery-only questions.
@@ -653,7 +802,7 @@ def calculate_blast_radius(
         
         matching_nodes = [nid for nid, d in G.nodes(data=True) if d.get("name") == target_symbol or nid == target_symbol]
         if not matching_nodes:
-            return f"### [Graph-RAG System Message]\nTarget code symbol '{target_symbol}' could not be matched."
+            return f"## Upstream dependents\n\nTarget symbol `{target_symbol}` could not be matched."
             
         impact_profiles = engine.compute_upstream_blast_radius(matching_nodes)
         
@@ -662,29 +811,12 @@ def calculate_blast_radius(
             key=lambda x: (x.get("file_path") or "", x.get("node_id") or ""),
         )
 
-        if format == "json":
-            items = impact_profiles[: max(0, max_items)]
-            return _json_dumps(
-                {
-                    "target_symbol": target_symbol,
-                    "matched_nodes": matching_nodes,
-                    "total_affected": len(impact_profiles),
-                    "items": items,
-                    "more": max(0, len(impact_profiles) - len(items)),
-                }
-            )
-
-        report = f"### UPSTREAM REGRESSION AUDIT FOR SYMBOL: `{target_symbol}`\n"
-        report += f"Modifying this entity creates a direct domino risk across **{len(impact_profiles)}** elements.\n\n"
-
-        shown = impact_profiles[: max(0, max_items)]
-        for item in shown:
-            report += f"- **[{item['type']}]** `{item['node_id']}` inside `{item['file_path']}`\n"
-        more = len(impact_profiles) - len(shown)
-        if more > 0:
-            report += f"\n... and {more} more.\n"
-
-        return report
+        return format_blast_radius_markdown(
+            target_symbol,
+            impact_profiles,
+            len(impact_profiles),
+            max_items,
+        )
     finally:
         model_manager.release()
 
@@ -695,12 +827,15 @@ def _build_node_payload(
     *,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
     workspace_root: Path | None = None,
+    include_neighbors: bool = True,
 ) -> dict[str, Any]:
-    """Single node: full source + 1-hop neighbor IDs."""
+    """Single node: full source; optional 1-hop neighbor IDs."""
     if not G.has_node(node_id):
         if workspace_root is not None:
             fb = _constant_fallback(workspace_root, node_id)
             if fb:
+                if not include_neighbors:
+                    fb = {k: v for k, v in fb.items() if k != "neighbors"}
                 return fb
         return {"node_id": node_id, "error": "not_indexed"}
 
@@ -709,6 +844,13 @@ def _build_node_payload(
     resolved_id = node_id
     chunk_text = node_data.get("chunk_text", "")
 
+    if node_type == "CONSTANT" and _is_hollow_constant_source(chunk_text) and workspace_root is not None:
+        fb = _constant_fallback(workspace_root, node_id)
+        if fb:
+            if not include_neighbors:
+                fb = {k: v for k, v in fb.items() if k != "neighbors"}
+            return fb
+
     if node_type != "CLASS" and _is_stub_source(chunk_text):
         alt_id = _find_impl_alternate(G, node_id, node_data)
         if alt_id:
@@ -716,11 +858,13 @@ def _build_node_payload(
             node_data = G.nodes[resolved_id]
             chunk_text = node_data.get("chunk_text", chunk_text)
 
-    callers, callees = get_call_neighbors(G, resolved_id, limit=neighbors_max)
-    neighbors = {"callers": callers, "callees": callees}
     source = (chunk_text or "").strip()
     start_line, end_line = _parse_line_span(node_data)
-
+    callers, callees = (
+        get_call_neighbors(G, resolved_id, limit=neighbors_max)
+        if include_neighbors
+        else ([], [])
+    )
     payload: dict[str, Any] = {
         "node_id": resolved_id,
         "type": node_type,
@@ -731,8 +875,9 @@ def _build_node_payload(
         "end_line": end_line,
         "source": source,
         **_source_completeness_fields(source),
-        "neighbors": neighbors,
     }
+    if include_neighbors:
+        payload["neighbors"] = {"callers": callers, "callees": callees}
 
     if node_type == "CLASS":
         payload["methods"] = [
@@ -752,27 +897,388 @@ def _build_node_payload(
     return payload
 
 
+def _build_node_metadata_payload(
+    G: nx.DiGraph,
+    node_id: str,
+    *,
+    neighbors_max: int = NEIGHBOR_ID_LIMIT,
+    workspace_root: Path | None = None,
+) -> dict[str, Any]:
+    """Metadata-only: signature, line span, neighbors — no source body."""
+    full = _build_node_payload(
+        G, node_id, neighbors_max=neighbors_max, workspace_root=workspace_root
+    )
+    if full.get("error"):
+        return full
+    meta: dict[str, Any] = {
+        "node_id": full["node_id"],
+        "type": full.get("type"),
+        "file_path": full.get("file_path"),
+        "name": full.get("name"),
+        "signature": full.get("signature", ""),
+        "start_line": full.get("start_line"),
+        "end_line": full.get("end_line"),
+        "neighbors": full.get("neighbors", {"callers": [], "callees": []}),
+    }
+    if full.get("resolved_stub_from"):
+        meta["resolved_stub_from"] = full["resolved_stub_from"]
+    if full.get("type") == "CLASS" and full.get("methods"):
+        meta["methods"] = full["methods"]
+    if full.get("type") == "CONSTANT" and full.get("source"):
+        snippet = (full["source"] or "").strip()
+        if snippet and not _is_hollow_constant_source(snippet):
+            meta["value_snippet"] = snippet[:200]
+    return meta
+
+
+def _fetch_node_payloads(
+    G: nx.DiGraph,
+    node_ids: list[str],
+    *,
+    mode: str,
+    neighbors_max: int,
+    workspace_root: Path,
+    include_neighbors: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Fetch node payloads with per-node server-side cache."""
+    builder = _build_node_metadata_payload if mode == "metadata" else _build_node_payload
+    nodes: list[dict[str, Any]] = []
+    hits, misses = 0, 0
+    for node_id in node_ids:
+        cache_key = (mode, str(workspace_root), node_id, neighbors_max, include_neighbors)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            nodes.append(cached)
+            hits += 1
+            continue
+        if mode == "metadata":
+            payload = builder(
+                G, node_id, neighbors_max=neighbors_max, workspace_root=workspace_root
+            )
+        else:
+            payload = builder(
+                G,
+                node_id,
+                neighbors_max=neighbors_max,
+                workspace_root=workspace_root,
+                include_neighbors=include_neighbors,
+            )
+        if not payload.get("error"):
+            _cache_set(cache_key, payload)
+        nodes.append(payload)
+        misses += 1
+    return nodes, {"hits": hits, "misses": misses}
+
+
+def _load_graph_for_workspace(workspace_root: Path) -> tuple[nx.DiGraph, Path, Path]:
+    graph_path, lock_path = get_graph_paths(workspace_root)
+    embedder = model_manager.acquire()
+    try:
+        with FileLock(lock_path):
+            G = GraphSerializer.load_from_json(workspace_root, graph_path)
+            if execute_preflight_lazy_sync(workspace_root, G, embedder):
+                GraphSerializer.save_to_json(G, workspace_root, graph_path)
+        return G, graph_path, lock_path
+    finally:
+        model_manager.release()
+
+
+def _run_ripgrep_references(
+    workspace_root: Path,
+    terms: list[str],
+    *,
+    include_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+    max_hits: int = 200,
+    context_lines: int = 0,
+) -> dict[str, Any]:
+    """Repo-wide text search via ripgrep; returns path + line + snippet only."""
+    cleaned = [t.strip() for t in terms if t and t.strip()]
+    if not cleaned:
+        return {"terms": terms, "hits": [], "coverage": {"searched_globs": []}}
+
+    cmd = [
+        "rg",
+        "-n",
+        "--no-heading",
+        f"--max-count={max(1, max_hits)}",
+        "--color=never",
+    ]
+    if context_lines > 0:
+        cmd.extend(["-C", str(context_lines)])
+
+    globs = include_globs if include_globs is not None else ["**/*"]
+    for glob in globs:
+        cmd.extend(["-g", glob])
+    for glob in exclude_globs or []:
+        cmd.extend(["-g", f"!{glob}"])
+    for term in cleaned:
+        cmd.extend(["-e", term])
+    cmd.append(str(workspace_root))
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {
+            "terms": cleaned,
+            "hits": [],
+            "error": "ripgrep (rg) not found on PATH",
+            "coverage": {"searched_globs": globs},
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "terms": cleaned,
+            "hits": [],
+            "error": "ripgrep timed out",
+            "coverage": {"searched_globs": globs},
+        }
+
+    hits: list[dict[str, Any]] = []
+    for line in (proc.stdout or "").splitlines():
+        if len(hits) >= max_hits:
+            break
+        if not line.strip():
+            continue
+        if line.startswith("--") and context_lines > 0:
+            continue
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        rel_path = Path(parts[0])
+        try:
+            rel_path = rel_path.relative_to(workspace_root)
+        except ValueError:
+            pass
+        try:
+            line_no = int(parts[1])
+        except ValueError:
+            continue
+        hits.append({
+            "file_path": str(rel_path).replace("\\", "/"),
+            "line": line_no,
+            "text": parts[2].strip()[:300],
+        })
+
+    return {
+        "terms": cleaned,
+        "hits": hits,
+        "truncated": len(hits) >= max_hits,
+        "coverage": {
+            "searched_globs": globs,
+            "rg_exit_code": proc.returncode,
+        },
+    }
+
+
 def _format_node_source(
     G: nx.DiGraph,
     node_id: str,
     *,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
-    format: str = "json",
 ) -> str:
-    """Returns full source + neighbor IDs."""
-    payload = _build_node_payload(G, node_id, neighbors_max=neighbors_max)
-    if format == "json":
-        return _json_dumps(payload)
-
+    """Returns full source as a cursor citation block."""
+    payload = _build_node_payload(
+        G, node_id, neighbors_max=neighbors_max, include_neighbors=False
+    )
     if payload.get("error"):
-        return f"### [Graph-RAG System Message]\n{payload['error']}"
+        return f"### {node_id}\n{payload['error']}"
 
-    body = f"### Source for `{payload['node_id']}`\n\n```python\n{payload.get('source', '')}\n```"
-    neighbors = payload.get("neighbors") or {}
-    rendered = _render_neighbors_markdown(neighbors)
-    if rendered:
-        body += f"\n\n### Graph neighbors\n{rendered}"
-    return body
+    block = cursor_citation(
+        payload.get("file_path"),
+        payload.get("start_line"),
+        payload.get("end_line"),
+        payload.get("source") or "",
+    )
+    return f"### {payload.get('name') or node_id}\nnode_id: {payload['node_id']}\n\n{block}"
+
+
+@mcp.tool()
+def fetch_node_metadata(
+    node_ids: list[str],
+    active_project_root: str,
+    neighbors_max: int = NEIGHBOR_ID_LIMIT,
+) -> str:
+    """Lightweight fetch: signatures, line ranges, callers/callees — no source bodies.
+
+    Use for edit planning and file-touch questions. Call fetch_node_source only when
+    you need full implementation bodies.
+
+    Args:
+        node_ids: Exact node_id(s) from search or grep output.
+        active_project_root: Absolute path to the repo root.
+        neighbors_max: Max caller/callee node_ids per node (default 50).
+    """
+    workspace_root = Path(active_project_root).resolve()
+    G = _load_graph_for_workspace(workspace_root)[0]
+
+    nodes, _cache_stats = _fetch_node_payloads(
+        G,
+        node_ids,
+        mode="metadata",
+        neighbors_max=neighbors_max,
+        workspace_root=workspace_root,
+    )
+    return format_metadata_markdown(nodes, G)
+
+
+@mcp.tool()
+def repo_references(
+    terms: list[str],
+    active_project_root: str,
+    include_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+    max_hits: int = 200,
+    context_lines: int = 0,
+) -> str:
+    """Repo-wide symbol references via ripgrep (tests, docs, markdown, history).
+
+    Returns file paths + line numbers + matched line snippets only — not full files.
+    Use for planning questions that span non-Python paths not in the graph.
+
+    Args:
+        terms: Literal strings to search for (symbol names, config keys).
+        active_project_root: Absolute path to the repo root.
+        include_globs: Optional glob filters (default: all files).
+        exclude_globs: Optional exclusion globs.
+        max_hits: Cap total hits returned.
+        context_lines: Extra context lines around each match (0 = match line only).
+    """
+    workspace_root = Path(active_project_root).resolve()
+    result = _run_ripgrep_references(
+        workspace_root,
+        terms,
+        include_globs=include_globs,
+        exclude_globs=exclude_globs,
+        max_hits=max_hits,
+        context_lines=context_lines,
+    )
+    if result.get("error"):
+        return format_error(str(result["error"]))
+    return format_repo_refs_markdown(result.get("hits", []), result.get("terms"))
+
+
+def _merge_touch_file(
+    bucket: dict[str, dict[str, Any]],
+    meta: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    fp = meta.get("file_path")
+    if not fp or meta.get("error"):
+        return
+    sl, el = meta.get("start_line"), meta.get("end_line")
+    line_range = [sl, el] if sl and el else []
+    if fp not in bucket:
+        bucket[fp] = {
+            "file_path": fp,
+            "reason": reason,
+            "node_ids": [meta["node_id"]],
+            "line_ranges": [line_range] if line_range else [],
+        }
+        return
+    entry = bucket[fp]
+    if meta["node_id"] not in entry["node_ids"]:
+        entry["node_ids"].append(meta["node_id"])
+    if line_range and line_range not in entry["line_ranges"]:
+        entry["line_ranges"].append(line_range)
+
+
+@mcp.tool()
+def plan_feature_touch_set(
+    feature_description: str,
+    grep_terms: list[str],
+    active_project_root: str,
+    max_files: int = 30,
+) -> str:
+    """Minimal PR surface: defining files + related callers + non-graph refs (tests/docs).
+
+    Returns file paths and line ranges only — no full source bodies.
+
+    Args:
+        feature_description: Short description of the feature or change.
+        grep_terms: Exact symbols to anchor the touch set.
+        active_project_root: Absolute path to the repo root.
+        max_files: Max files per required/related bucket.
+    """
+    workspace_root = Path(active_project_root).resolve()
+    graph_path, lock_path = get_graph_paths(workspace_root)
+
+    embedder = model_manager.acquire()
+    reranker = model_manager.acquire_reranker()
+    try:
+        with FileLock(lock_path):
+            G = GraphSerializer.load_from_json(workspace_root, graph_path)
+            if execute_preflight_lazy_sync(workspace_root, G, embedder):
+                GraphSerializer.save_to_json(G, workspace_root, graph_path)
+
+        engine = AdvancedRetrievalEngine(
+            graph_instance=G,
+            embedder_instance=embedder,
+            reranker=reranker,
+        )
+        queries = [feature_description.strip()] if feature_description and feature_description.strip() else []
+        bucketed = engine.compile_bucketed_context_package(
+            search_queries=queries,
+            grep_terms=grep_terms,
+        )
+
+        primary_ids: list[str] = []
+        for node in bucketed.get("semantic_bucket", {}).get("nodes", []):
+            primary_ids.append(node["node_id"])
+        for bucket in bucketed.get("grep_buckets", []):
+            for node in bucket.get("nodes", []):
+                primary_ids.append(node["node_id"])
+
+        seen: set[str] = set()
+        ordered_primary: list[str] = []
+        for nid in primary_ids:
+            if nid not in seen:
+                seen.add(nid)
+                ordered_primary.append(nid)
+
+        expanded: set[str] = set(ordered_primary)
+        for nid in ordered_primary[:8]:
+            meta = _build_node_metadata_payload(
+                G, nid, workspace_root=workspace_root, neighbors_max=5
+            )
+            for caller in (meta.get("neighbors") or {}).get("callers", [])[:3]:
+                expanded.add(caller)
+            for callee in (meta.get("neighbors") or {}).get("callees", [])[:3]:
+                expanded.add(callee)
+
+        required_files: dict[str, dict[str, Any]] = {}
+        related_files: dict[str, dict[str, Any]] = {}
+        primary_set = set(ordered_primary)
+        for nid in expanded:
+            meta = _build_node_metadata_payload(
+                G, nid, workspace_root=workspace_root, neighbors_max=5
+            )
+            if nid in primary_set:
+                _merge_touch_file(required_files, meta, reason="semantic_or_grep_hit")
+            else:
+                _merge_touch_file(related_files, meta, reason="caller_or_callee")
+
+        non_graph = _run_ripgrep_references(
+            workspace_root,
+            grep_terms,
+            include_globs=_DEFAULT_REPO_REF_GLOBS,
+            max_hits=100,
+        )
+
+        return format_touch_set_markdown(
+            feature_description,
+            list(required_files.values())[:max_files],
+            list(related_files.values())[:max_files],
+            non_graph.get("hits", []),
+        )
+    finally:
+        model_manager.release()
 
 
 @mcp.tool()
@@ -780,78 +1286,71 @@ def fetch_node_source(
     node_ids: list[str],
     active_project_root: str,
     neighbors_max: int = NEIGHBOR_ID_LIMIT,
-    format: str = "json",
 ) -> str:
-    """Full AST-bound source + citation lines + neighbor IDs for one or more node_ids.
+    """Full AST-bound source + citation lines for one or more node_ids (no neighbors).
 
-    Each node includes start_line, end_line, source_complete: true (never truncated).
     Module constants use node_id like path/file.py::CONSTANT_NAME.
 
     Args:
-        node_ids: Exact node_id(s) from search output neighbors or candidates.
+        node_ids: Exact node_id(s) from search or grep output.
         active_project_root: Absolute path to the repo root.
-        neighbors_max: Max caller/callee node_ids per node (default 50).
-        format: "json" (default) or "markdown".
+        neighbors_max: Deprecated; kept for API compatibility.
     """
     workspace_root = Path(active_project_root).resolve()
-    graph_path, lock_path = get_graph_paths(workspace_root)
+    G = _load_graph_for_workspace(workspace_root)[0]
 
-    embedder = model_manager.acquire()
-    try:
-        with FileLock(lock_path):
-            G = GraphSerializer.load_from_json(workspace_root, graph_path)
-            if execute_preflight_lazy_sync(workspace_root, G, embedder):
-                GraphSerializer.save_to_json(G, workspace_root, graph_path)
+    nodes, _cache_stats = _fetch_node_payloads(
+        G,
+        node_ids,
+        mode="source",
+        neighbors_max=neighbors_max,
+        workspace_root=workspace_root,
+        include_neighbors=False,
+    )
+    return format_source_markdown(nodes)
 
-        nodes = [
-            _build_node_payload(
-                G, node_id, neighbors_max=neighbors_max, workspace_root=workspace_root
-            )
-            for node_id in node_ids
-        ]
-        if format == "json":
-            ok = all(
-                n.get("source_complete") and not n.get("error") for n in nodes
-            )
-            return _json_dumps({
-                "nodes": nodes,
-                "do_not_use_native_read": ok,
-                "sufficient_to_answer": ok,
-            })
 
-        parts = [
-            _format_node_source(
-                G,
-                node_id,
-                neighbors_max=neighbors_max,
-                format="markdown",
-            )
-            for node_id in node_ids
-        ]
-        return "\n\n---\n\n".join(parts)
-    finally:
-        model_manager.release()
+@mcp.tool()
+def fetch_snippets(
+    node_ids: list[str],
+    active_project_root: str,
+    max_lines: int = 30,
+) -> str:
+    """Line-capped AST-bound excerpts for many node_ids in one batched call (no neighbors).
+
+    Use when search snippets are truncated or you need additional node_ids.
+
+    Args:
+        node_ids: Exact node_id(s) from search or grep — pass every skim target at once.
+        active_project_root: Absolute path to the repo root.
+        max_lines: Max lines per snippet (default 30); tail return lines included when truncated.
+    """
+    workspace_root = Path(active_project_root).resolve()
+    G = _load_graph_for_workspace(workspace_root)[0]
+    cap = max(1, int(max_lines))
+
+    full_nodes, _cache_stats = _fetch_node_payloads(
+        G,
+        node_ids,
+        mode="source",
+        neighbors_max=NEIGHBOR_ID_LIMIT,
+        workspace_root=workspace_root,
+        include_neighbors=False,
+    )
+    nodes = [_to_snippet_payload(p, cap) for p in full_nodes]
+    return format_snippets_markdown(nodes)
 
 
 @mcp.tool()
 def trace_callers(
     node_id: str,
-    # active_project_root: str,
-    format: str = "json",
-    # max_items: int = 50,
 ) -> str:
-    """Deprecated. Use fetch_node_source — it includes 1-hop callers and callees."""
-    msg = {
-        "deprecated": True,
-        "message": "trace_callers is deprecated. Use fetch_node_source(node_ids=[...]) which includes 1-hop callers and callees.",
-        "use_instead": {
-            "tool": "fetch_node_source",
-            "args": {"node_ids": [node_id]},
-        },
-    }
-    if format == "json":
-        return _json_dumps(msg)
-    return msg["message"]
+    """Deprecated. Use search_codebase_intent for callers/callees, then fetch_snippets or fetch_node_source."""
+    return (
+        "## Deprecated\n\n"
+        "trace_callers is deprecated. Use search_codebase_intent for graph neighbors "
+        "(call chain is included in search results), then fetch_snippets or fetch_node_source for code."
+    )
 
 
 if __name__ == "__main__":

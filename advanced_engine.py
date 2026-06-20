@@ -11,17 +11,17 @@ import re
 
 from fileParsing.scanAST import build_semantic_skeleton
 
-SEARCH_RESULT_LIMIT = 6
+SEARCH_RESULT_LIMIT = 2
 SEMANTIC_POOL_SIZE = 50
 STAGE1_POOL_SIZE = 20
 STAGE1_SEMANTIC_WEIGHT = 0.7
 STAGE1_KEYWORD_WEIGHT = 0.3
 SOURCE_EXCERPT_MAX_LINES = 100
-NEIGHBOR_ID_LIMIT = 50
-BUCKET_SEMANTIC_TOP_K = 3
-GREP_NEIGHBOR_LIMIT = 5
+NEIGHBOR_ID_LIMIT = 5
+BUCKET_SEMANTIC_TOP_K = 2
 GREP_FUZZY_TOP_K = 3
 GREP_EXACT_TOP_K = 1
+NEIGHBOR_RERANK_POOL = 20
 
 _STOPWORDS = frozenset({
     "the", "a", "an", "is", "are", "was", "were", "how", "what", "where", "when",
@@ -110,12 +110,46 @@ def build_rerank_passage(data: Dict[str, Any]) -> str:
     return skeleton or meta
 
 
+_NON_PYTHON_PATH_HINTS = [
+    "tests/**",
+    "test/**",
+    "docs/**",
+    "doc/**",
+    "**/*.md",
+    "**/*.rst",
+    "HISTORY.*",
+    "CHANGELOG.*",
+]
+
+
 def graph_coverage_fields(G: nx.DiGraph) -> dict[str, Any]:
     file_nodes = [d for _, d in G.nodes(data=True) if d.get("type") == "FILE"]
     return {
+        "python_only": True,
         "python_files_indexed": len(file_nodes),
         "last_indexed_at": G.graph.get("last_synced_at"),
         "missing_paths": [],
+        "non_python_paths_relevant": list(_NON_PYTHON_PATH_HINTS),
+    }
+
+
+def discovery_sufficiency_fields(has_hits: bool) -> dict[str, Any]:
+    """Search/grep responses: discovery only — never claim native read is forbidden."""
+    if has_hits:
+        return {
+            "sufficient_for": ["discovery"],
+            "sufficient_to_answer": True,
+            "sufficient_to_answer_reason": (
+                "Bucketed node metadata returned. For behavior use fetch_node_source; "
+                "for edit planning use fetch_node_metadata or plan_feature_touch_set."
+            ),
+            "do_not_use_native_read": False,
+        }
+    return {
+        "sufficient_for": [],
+        "sufficient_to_answer": False,
+        "sufficient_to_answer_reason": "No graph matches; native grep/read may be needed.",
+        "do_not_use_native_read": False,
     }
 
 
@@ -130,21 +164,22 @@ def build_grep_text(data: Dict[str, Any]) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
-def format_compact_candidate(
-    G: nx.DiGraph,
+def _parse_line_span(meta: Dict[str, Any]) -> tuple[int | None, int | None]:
+    span = meta.get("line_span")
+    if span and isinstance(span, (list, tuple)) and len(span) >= 2:
+        return int(span[0]), int(span[1])
+    return None, None
+
+
+def format_grep_match(
     node_id: str,
     meta: Dict[str, Any],
     *,
     score: float | None = None,
-    neighbors_limit: int = GREP_NEIGHBOR_LIMIT,
     match_mode: str | None = None,
 ) -> Dict[str, Any]:
-    """Token-tight node payload: embedding_text + neighbor IDs only."""
-    callers, callees = get_call_neighbors(G, node_id, limit=neighbors_limit)
-    start_line, end_line = None, None
-    span = meta.get("line_span")
-    if span and isinstance(span, (list, tuple)) and len(span) >= 2:
-        start_line, end_line = int(span[0]), int(span[1])
+    """Minimal grep hit: identity + span only (no neighbors, no embedding_text)."""
+    start_line, end_line = _parse_line_span(meta)
     out: Dict[str, Any] = {
         "node_id": node_id,
         "type": meta.get("type"),
@@ -153,8 +188,6 @@ def format_compact_candidate(
         "signature": meta.get("signature", ""),
         "start_line": start_line,
         "end_line": end_line,
-        "embedding_text": (meta.get("embedding_text") or "").strip(),
-        "neighbors": {"callers": callers, "callees": callees},
     }
     if score is not None:
         out["score"] = round(score, 4)
@@ -163,18 +196,221 @@ def format_compact_candidate(
     return out
 
 
-def _grep_literal_rank(term: str, node_id: str, data: Dict[str, Any], case_sensitive: bool) -> float:
+def format_search_candidate(
+    G: nx.DiGraph,
+    node_id: str,
+    meta: Dict[str, Any],
+    *,
+    score: float | None = None,
+    match_mode: str | None = None,
+) -> Dict[str, Any]:
+    """Search hit: identity + span only (no embedding_text, no neighbor arrays)."""
+    start_line, end_line = _parse_line_span(meta)
+    out: Dict[str, Any] = {
+        "node_id": node_id,
+        "type": meta.get("type"),
+        "file_path": meta.get("file_path"),
+        "name": meta.get("name"),
+        "signature": meta.get("signature", ""),
+        "start_line": start_line,
+        "end_line": end_line,
+    }
+    if score is not None:
+        out["score"] = round(score, 4)
+    if match_mode:
+        out["match_mode"] = match_mode
+    return out
+
+
+def call_chain_entry(G: nx.DiGraph, node_id: str, role: str) -> Dict[str, Any]:
+    meta = G.nodes.get(node_id, {})
+    start_line, end_line = _parse_line_span(meta)
+    return {
+        "role": role,
+        "node_id": node_id,
+        "name": meta.get("name"),
+        "file_path": meta.get("file_path"),
+        "start_line": start_line,
+        "end_line": end_line,
+        "signature": meta.get("signature", ""),
+    }
+
+
+def build_query_ranked_call_chain(
+    G: nx.DiGraph,
+    anchor_id: str,
+    queries: List[str],
+    *,
+    embedder: Any = None,
+    reranker: Any = None,
+    max_callers: int = 2,
+    max_callees: int = 2,
+    max_downstream_hops: int = 1,
+) -> List[Dict[str, Any]]:
+    """Ordered upstream callers → anchor → downstream callees (query-ranked)."""
+    if not G.has_node(anchor_id):
+        return [call_chain_entry(G, anchor_id, "anchor")]
+
+    neighbors = rank_call_neighbors(
+        G,
+        anchor_id,
+        queries,
+        embedder=embedder,
+        reranker=reranker,
+        limit=max(max_callers, max_callees, 1),
+    )
+    callers = neighbors.get("callers", [])[:max_callers]
+    callees = neighbors.get("callees", [])[:max_callees]
+
+    chain: List[Dict[str, Any]] = []
+    for nid in reversed(callers):
+        chain.append(call_chain_entry(G, nid, "caller"))
+    chain.append(call_chain_entry(G, anchor_id, "anchor"))
+    for nid in callees:
+        chain.append(call_chain_entry(G, nid, "callee"))
+
+    if max_downstream_hops > 0 and callees:
+        top_callee = callees[0]
+        if G.has_node(top_callee):
+            sub = rank_call_neighbors(
+                G,
+                top_callee,
+                queries,
+                embedder=embedder,
+                reranker=reranker,
+                limit=1,
+            )
+            seen = {e["node_id"] for e in chain}
+            for nid in sub.get("callees", [])[:1]:
+                if nid not in seen:
+                    chain.append(call_chain_entry(G, nid, "downstream"))
+
+    return chain
+
+
+def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    a = np.array(vec_a)
+    b = np.array(vec_b)
+    if a.shape[0] == 0 or b.shape[0] == 0:
+        return 0.0
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def _all_call_neighbors(G: nx.DiGraph, node_id: str) -> tuple[list[str], list[str]]:
+    """Return all 1-hop CALLS predecessors and successors (uncapped)."""
+    if not G.has_node(node_id):
+        return [], []
+    callers = sorted(
+        p for p in G.predecessors(node_id)
+        if G.edges[p, node_id].get("relationship") == "CALLS"
+    )
+    callees = sorted(
+        s for s in G.successors(node_id)
+        if G.edges[node_id, s].get("relationship") == "CALLS"
+    )
+    return callers, callees
+
+
+def rank_call_neighbors(
+    G: nx.DiGraph,
+    node_id: str,
+    queries: List[str],
+    *,
+    embedder: Any = None,
+    reranker: Any = None,
+    limit: int = NEIGHBOR_ID_LIMIT,
+) -> dict[str, list[str]]:
+    """Rank 1-hop callers/callees by query relevance (embedding + optional cross-encoder)."""
+    callers_all, callees_all = _all_call_neighbors(G, node_id)
+    if not callers_all and not callees_all:
+        return {"callers": [], "callees": []}
+
+    cleaned_queries = [q.strip() for q in queries if q and q.strip()]
+    query_vectors: list[list[float]] = []
+    if embedder is not None and cleaned_queries:
+        encoded = embedder.model.encode(cleaned_queries, convert_to_numpy=True)
+        if encoded.ndim == 1:
+            encoded = encoded.reshape(1, -1)
+        query_vectors = [qv.tolist() for qv in encoded]
+
+    def _embedding_score(nid: str) -> float:
+        data = G.nodes.get(nid, {})
+        emb = data.get("embedding")
+        if not emb or not query_vectors:
+            return float(data.get("call_centrality") or 0)
+        sim = max(_cosine_similarity(qv, emb) for qv in query_vectors)
+        centrality = float(data.get("call_centrality") or 0)
+        return sim + 0.1 * centrality
+
+    def _rank_side(ids: list[str]) -> list[str]:
+        if not ids:
+            return []
+        scored = [(nid, _embedding_score(nid)) for nid in ids]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        pool = scored[:NEIGHBOR_RERANK_POOL]
+
+        if reranker and cleaned_queries and pool:
+            pairs: list[list[str]] = []
+            pair_ids: list[str] = []
+            for nid, _ in pool:
+                passage = build_rerank_passage(G.nodes[nid])
+                for query in cleaned_queries:
+                    pairs.append([query, passage])
+                    pair_ids.append(nid)
+            ce_scores = reranker.predict(pairs, batch_size=16)
+            node_max: dict[str, float] = {}
+            for nid, score in zip(pair_ids, ce_scores):
+                score_f = float(score)
+                if nid not in node_max or score_f > node_max[nid]:
+                    node_max[nid] = score_f
+            pool = sorted(node_max.items(), key=lambda x: x[1], reverse=True)
+            return [nid for nid, _ in pool[:limit]]
+
+        return [nid for nid, _ in pool[:limit]]
+
+    return {
+        "callers": _rank_side(callers_all),
+        "callees": _rank_side(callees_all),
+    }
+
+
+def _grep_literal_rank(
+    term: str,
+    node_id: str,
+    data: Dict[str, Any],
+    case_sensitive: bool,
+    affinity_paths: set[str] | None = None,
+) -> float:
     """Higher = better literal match (exact name preferred)."""
     name = data.get("name") or ""
+    sig = data.get("signature") or ""
     t = term if case_sensitive else term.lower()
     n = name if case_sensitive else name.lower()
+    s = sig if case_sensitive else sig.lower()
+    centrality = float(data.get("call_centrality") or 0)
+
     if n == t:
-        return 100.0
-    if n.endswith(f".{t}") or f".{t}" in node_id:
-        return 90.0
-    if t in n:
-        return 70.0 + float(data.get("call_centrality") or 0)
-    return 50.0 + float(data.get("call_centrality") or 0)
+        score = 100.0
+    elif n.endswith(f".{t}") or f".{t}" in node_id:
+        score = 90.0
+    elif t in n:
+        score = 70.0 + centrality
+    elif t in s and t not in n:
+        score = 35.0 + centrality
+    else:
+        score = 50.0 + centrality
+
+    if len(t) <= 4 and n != t and t in s:
+        score -= 25.0
+
+    if affinity_paths and data.get("file_path") in affinity_paths:
+        score += 15.0
+
+    return score
 
 
 def _grep_fuzzy_rank(term: str, node_id: str, data: Dict[str, Any], case_sensitive: bool) -> float:
@@ -199,6 +435,7 @@ def grep_search_nodes(
     case_sensitive: bool = False,
     embedder: Any = None,
     fuzzy_top_k: int = GREP_FUZZY_TOP_K,
+    affinity_paths: set[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """Literal grep on grep_text; exact mode returns top 1, fuzzy mode returns top 3."""
     term = (term or "").strip()
@@ -213,14 +450,16 @@ def grep_search_nodes(
         hay = grep_text if case_sensitive else grep_text.lower()
         needle = term if case_sensitive else term.lower()
         if needle in hay:
-            score = _grep_literal_rank(term, node_id, data, case_sensitive)
+            score = _grep_literal_rank(
+                term, node_id, data, case_sensitive, affinity_paths=affinity_paths
+            )
             literal_hits.append((node_id, data, score))
 
     if literal_hits:
         literal_hits.sort(key=lambda x: x[2], reverse=True)
         top = literal_hits[:GREP_EXACT_TOP_K]
         return [
-            format_compact_candidate(G, nid, meta, score=sc, match_mode="exact")
+            format_grep_match(nid, meta, score=sc, match_mode="exact")
             for nid, meta, sc in top
         ]
 
@@ -243,7 +482,7 @@ def grep_search_nodes(
     fuzzy_hits.sort(key=lambda x: x[2], reverse=True)
     top = fuzzy_hits[:fuzzy_top_k]
     return [
-        format_compact_candidate(G, nid, meta, score=sc, match_mode="fuzzy")
+        format_grep_match(nid, meta, score=sc, match_mode="fuzzy")
         for nid, meta, sc in top
     ]
 
@@ -372,7 +611,7 @@ class AdvancedRetrievalEngine:
         search_queries: List[str],
         keywords: List[str] | None = None,
     ) -> List[Dict[str, Any]]:
-        """Two-stage retrieval: semantic top 50 → keyword blend top 20 → cross-encoder top 6."""
+        """Two-stage retrieval: semantic top 50 → keyword blend top 20 → cross-encoder top 2."""
         keyword_list = keywords or []
         queries = [q.strip() for q in search_queries if q and q.strip()]
         if not queries:
@@ -483,9 +722,8 @@ class AdvancedRetrievalEngine:
         # targeted_symbols: List[str] = None,
         top_k: int | None = None,
         output_format: str = "json",
-        include_next_action: bool = True,
     ) -> str:
-        """Multi-query hybrid retrieval. Top 2 hits include capped source_excerpt + neighbor IDs."""
+        """Multi-query hybrid retrieval. Returns metadata only (no source excerpts)."""
         keywords = extract_keywords_from_queries(search_queries)
         query_hits = self.run_hybrid_retrieval(search_queries, keywords=keywords)
 
@@ -505,51 +743,36 @@ class AdvancedRetrievalEngine:
             return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
 
         def _neighbor_ids(nid: str) -> dict[str, list[str]]:
-            callers, callees = get_call_neighbors(self.G, nid, limit=NEIGHBOR_ID_LIMIT)
-            return {"callers": callers, "callees": callees}
+            return rank_call_neighbors(
+                self.G,
+                nid,
+                search_queries,
+                embedder=self.embedder,
+                reranker=self.reranker,
+                limit=NEIGHBOR_ID_LIMIT,
+            )
 
         if output_format == "json":
             candidates: list[dict[str, Any]] = []
-            for idx, hit in enumerate(final_seeds):
+            for hit in final_seeds:
                 meta = hit["metadata"]
                 node_id = hit["node_id"]
-                candidate: dict[str, Any] = {
-                    "node_id": node_id,
-                    "type": meta.get("type"),
-                    "file_path": meta.get("file_path"),
-                    "name": meta.get("name"),
-                    "signature": meta.get("signature", ""),
-                    "score": hit["hybrid_score"],
-                    "neighbors": _neighbor_ids(node_id),
-                }
-                if idx < 2 and meta.get("chunk_text"):
-                    excerpt = extract_source_excerpt(
-                        meta.get("chunk_text", ""),
-                        meta.get("type", "FUNCTION"),
-                    )
-                    candidate["source_excerpt"] = excerpt
-                    truncated = "# ... truncated" in excerpt
-                    candidate["truncated"] = truncated
-                    candidate["source_complete"] = not truncated
-                    if truncated:
-                        candidate["fetch_hint"] = "Call fetch_node_source for full source."
+                candidate = format_search_candidate(
+                    self.G,
+                    node_id,
+                    meta,
+                    score=hit["hybrid_score"],
+                )
                 candidates.append(candidate)
 
-            best_id = candidates[0]["node_id"] if candidates else None
             has_hits = bool(candidates)
             out: dict[str, Any] = {
                 "queries": search_queries,
                 "keywords": keywords,
                 "candidates": candidates,
                 "graph_coverage": graph_coverage_fields(self.G),
-                "sufficient_to_answer": has_hits,
-                "do_not_use_native_read": has_hits,
+                **discovery_sufficiency_fields(has_hits),
             }
-            if include_next_action and best_id:
-                out["next_action"] = {
-                    "tool": "fetch_node_source",
-                    "args": {"node_ids": [best_id]},
-                }
             return _json_dumps(out)
 
         markdown = "## Codebase Search Results\n\n"
@@ -569,11 +792,10 @@ class AdvancedRetrievalEngine:
             markdown += f"- score: {hit['hybrid_score']:.4f} | callers: {hit['callers']}\n"
             markdown += f"- type: {meta.get('type')}\n"
             markdown += f"- signature: {meta.get('signature', '()')}\n"
+            emb = (meta.get("embedding_text") or "").strip()
+            if emb:
+                markdown += f"- embedding_text: {emb}\n"
             markdown += f"- neighbors: callers={len(neighbors['callers'])}, callees={len(neighbors['callees'])}\n"
-
-            if idx <= 2 and meta.get("chunk_text"):
-                excerpt = extract_source_excerpt(meta.get("chunk_text", ""), meta.get("type", "FUNCTION"))
-                markdown += f"\n```python\n{excerpt}\n```\n"
             markdown += "\n"
 
         return markdown
@@ -582,10 +804,8 @@ class AdvancedRetrievalEngine:
         self,
         search_queries: List[str],
         grep_terms: List[str] | None = None,
-        *,
-        include_next_action: bool = True,
-    ) -> str:
-        """Bucketed retrieval: semantic top-3 + per-grep-term top-(1|3), no source excerpts."""
+    ) -> dict[str, Any]:
+        """Bucketed retrieval: semantic top-2 + per-grep-term top-(1|3)."""
         grep_terms = [t.strip() for t in (grep_terms or []) if t and t.strip()]
         queries = [q.strip() for q in search_queries if q and q.strip()]
 
@@ -594,14 +814,15 @@ class AdvancedRetrievalEngine:
             query_hits = self.run_hybrid_retrieval(queries, keywords=[])
             for hit in query_hits[:BUCKET_SEMANTIC_TOP_K]:
                 semantic_nodes.append(
-                    format_compact_candidate(
+                    format_search_candidate(
                         self.G,
                         hit["node_id"],
                         hit["metadata"],
                         score=hit["hybrid_score"],
-                        neighbors_limit=GREP_NEIGHBOR_LIMIT,
                     )
                 )
+
+        affinity_paths = {n["file_path"] for n in semantic_nodes if n.get("file_path")}
 
         grep_buckets: list[dict[str, Any]] = []
         for term in grep_terms:
@@ -609,6 +830,7 @@ class AdvancedRetrievalEngine:
                 self.G,
                 term,
                 embedder=self.embedder,
+                affinity_paths=affinity_paths or None,
             )
             grep_buckets.append({
                 "term": term,
@@ -616,27 +838,10 @@ class AdvancedRetrievalEngine:
                 "nodes": nodes,
             })
 
-        all_ids = [n["node_id"] for n in semantic_nodes]
-        for bucket in grep_buckets:
-            all_ids.extend(n["node_id"] for n in bucket.get("nodes", []))
-
-        has_hits = bool(semantic_nodes) or any(b.get("nodes") for b in grep_buckets)
-        out: dict[str, Any] = {
+        return {
             "rewritten_queries": queries,
             "grep_terms": grep_terms,
-            "semantic_bucket": {
-                "nodes": semantic_nodes,
-            },
+            "semantic_bucket": {"nodes": semantic_nodes},
             "grep_buckets": grep_buckets,
-            "graph_coverage": graph_coverage_fields(self.G),
-            "sufficient_to_answer": has_hits,
-            "do_not_use_native_read": has_hits,
         }
-        if include_next_action and all_ids:
-            out["next_action"] = {
-                "tool": "fetch_node_source",
-                "args": {"node_ids": all_ids[:3]},
-                "hint": "Use fetch_node_source with node_ids when you need full source code.",
-            }
-        return json.dumps(out, ensure_ascii=False, separators=(",", ":"), default=str)
 

@@ -15,6 +15,7 @@ try:
         get_graph_paths,
         trace_callers,
         fetch_node_source,
+        fetch_snippets,
         execute_preflight_lazy_sync,
     )
     from graph_io import GraphSerializer
@@ -120,7 +121,6 @@ def run_system_audit() -> None:
         search_queries=SEARCH_QUERIES,
         active_project_root=TEST_PROJECT_ROOT,
         top_k=8,
-        include_next_action=True,
     )
     try:
         parsed = json.loads(search_json)
@@ -327,6 +327,37 @@ def run_system_audit() -> None:
         )
     except Exception as e:
         results.append(_verdict(False, f"fetch json parse failed: {e}"))
+
+    # --- 4b. fetch_snippets (batched skim) ---
+    _print_block(
+        "Step 4b — fetch_snippets",
+        [
+            "Purpose: line-capped excerpts for batched node_ids.",
+            f"Input: node_ids=[{CALL_GRAPH_NODE!r}], max_lines=10",
+        ],
+    )
+    snippet_json = fetch_snippets(
+        node_ids=[CALL_GRAPH_NODE],
+        active_project_root=TEST_PROJECT_ROOT,
+        max_lines=10,
+    )
+    try:
+        snippet_parsed = json.loads(snippet_json)
+        snodes = snippet_parsed.get("nodes") or []
+        snode = snodes[0] if snodes else {}
+        has_snippet = bool(snode.get("snippet"))
+        has_span = snode.get("start_line") is not None and snode.get("end_line") is not None
+        capped = snippet_parsed.get("max_lines") == 10
+        results.append(
+            _verdict(
+                has_snippet and has_span and capped,
+                "fetch_snippets returns snippet, line span, and max_lines"
+                if has_snippet and has_span and capped
+                else "missing snippet, line span, or max_lines",
+            )
+        )
+    except Exception as e:
+        results.append(_verdict(False, f"fetch_snippets json parse failed: {e}"))
 
     # --- 5. graph CALLS edges (internal check) ---
     _print_block(
