@@ -108,12 +108,18 @@ class GraphSerializer:
 
             for file_path in python_files:
                 repo_relative_path = str(file_path.relative_to(repo_root))
-                for node_id, data in extract_file_entities(repo_relative_path, repo_root).items():
+                for node_id, data in extract_file_entities(
+                    repo_relative_path,
+                    repo_root,
+                    enable_auto_docstrings=False,
+                ).items():
                     if G.has_node(node_id):
                         G.nodes[node_id]["chunk_text"] = data["chunk_text"]
                         G.nodes[node_id]["embedding_text"] = data["embedding_text"]
-            G.graph["chunk_schema"] = 3
-            G.graph["calls_schema"] = 1
+                        if data.get("line_span"):
+                            G.nodes[node_id]["line_span"] = data["line_span"]
+                        if data.get("body_hash"):
+                            G.nodes[node_id]["body_hash"] = data["body_hash"]
 
             # Output detailed diagnostics to verify your metrics
             summary = code_graph_instance.get_summary()

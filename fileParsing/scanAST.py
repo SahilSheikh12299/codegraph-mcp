@@ -1,6 +1,11 @@
 import ast
+import copy
+import hashlib
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
+
+from ollama_client import OllamaError, generate_intent_docstring
 
 class ASTParser:
     """Parses a single Python file using the native AST module to extract
@@ -145,11 +150,82 @@ def build_embedding_text(
     if node_type == "CLASS" and bases:
         lines.append(f"Inherits: {', '.join(bases)}")
     if node_type == "FUNCTION":
-        lines.append(f"Signature: def {name}{signature}")
+        # Per project requirement: embeddings use only function name + docstring.
+        # No args, variables, code lines, or signature content.
+        pass
     if docstring:
-        first_line = docstring.strip().split("\n")[0]
-        lines.append(f"Summary: {first_line[:300]}")
+        lines.append(f"Doc: {docstring.strip()[:600]}")
     return "\n".join(lines)
+
+
+def _function_body_hash(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """Stable hash of function body structure (excludes docstring; ignores whitespace)."""
+    body = list(node.body or [])
+    if body:
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, (ast.Str, ast.Constant))
+            and isinstance(getattr(first.value, "s", None) or getattr(first.value, "value", None), str)
+        ):
+            body = body[1:]
+
+    cloned = copy.copy(node)
+    cloned.body = body
+    dumped = ast.dump(cloned, include_attributes=False)
+    return hashlib.sha1(dumped.encode("utf-8")).hexdigest()
+
+
+def _first_n_nonempty_lines(text: str, n: int) -> str:
+    out: list[str] = []
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            continue
+        out.append(ln.rstrip())
+        if len(out) >= n:
+            break
+    return "\n".join(out).strip()
+
+
+def _should_auto_docstrings() -> bool:
+    # Default enabled; can be disabled for speed/debug.
+    val = os.getenv("CURSOR_GRAPHRAG_AUTO_DOCSTRINGS", "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def _auto_docstring_for_function(
+    *,
+    function_name: str,
+    chunk_text: str,
+    doc_cache: dict[str, str],
+    body_hash: str,
+    model: str,
+    timeout_s: float,
+) -> str:
+    cached = (doc_cache or {}).get(body_hash)
+    if cached:
+        return cached
+
+    snippet = _first_n_nonempty_lines(chunk_text, 30)
+    if not snippet:
+        return ""
+
+    try:
+        doc = generate_intent_docstring(
+            function_name=function_name,
+            snippet=snippet,
+            model=model,
+            timeout_s=timeout_s,
+        )
+    except OllamaError:
+        return ""
+
+    if doc:
+        doc_cache[body_hash] = doc
+    return doc
 
 
 _MAX_UNPARSE_LEN = 80
@@ -334,7 +410,15 @@ def build_semantic_skeleton(
     return "\n".join(lines)
 
 
-def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
+def extract_file_entities(
+    rel_path: str,
+    repo_root: Path,
+    *,
+    doc_cache: dict[str, str] | None = None,
+    ollama_model: str = "qwen2.5:1.5b",
+    ollama_timeout_s: float = 20.0,
+    enable_auto_docstrings: bool | None = None,
+) -> dict:
     """Parses a python file using its absolute path, but labels the nodes
 
     using the relative path format to match the existing graph ledger.
@@ -353,6 +437,8 @@ def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
         return {}
         
     entities = {}
+    cache: dict[str, str] = doc_cache if doc_cache is not None else {}
+    auto_enabled = _should_auto_docstrings() if enable_auto_docstrings is None else enable_auto_docstrings
     
     class RepoASTVisitor(ast.NodeVisitor):
         def __init__(self):
@@ -387,25 +473,51 @@ def extract_file_entities(rel_path: str, repo_root: Path) -> dict:
                 
             args = [arg.arg for arg in node.args.args]
             signature = f"({', '.join(args)})"
-            docstring = ast.get_docstring(node) or ""
+            native_docstring = ast.get_docstring(node) or ""
+            body_hash = _function_body_hash(node)
+            chunk_text = ast.get_source_segment(source, node) or ""
+
+            auto_docstring = ""
+            docstring_source = "native"
+            chosen_docstring = native_docstring
+            if not native_docstring and auto_enabled:
+                auto_docstring = _auto_docstring_for_function(
+                    function_name=node.name,
+                    chunk_text=chunk_text,
+                    doc_cache=cache,
+                    body_hash=body_hash,
+                    model=ollama_model,
+                    timeout_s=ollama_timeout_s,
+                )
+                if auto_docstring:
+                    chosen_docstring = auto_docstring
+                    docstring_source = "auto"
+                else:
+                    chosen_docstring = ""
+                    docstring_source = "none"
+
             entities[node_id] = {
                 "type": "FUNCTION",
                 "name": node.name,
                 "file_path": rel_path,
-                "chunk_text": ast.get_source_segment(source, node),
+                "chunk_text": chunk_text,
                 "line_span": (node.lineno, node.end_lineno or node.lineno),
                 "signature": signature,
-                "docstring": docstring,
+                "docstring": chosen_docstring,
+                "auto_docstring": auto_docstring,
+                "docstring_source": docstring_source,
+                "body_hash": body_hash,
                 "belongs_to_class": self.current_class,
                 "embedding_text": build_embedding_text(
                     "FUNCTION",
                     node.name,
-                    signature=signature,
-                    docstring=docstring,
+                    docstring=chosen_docstring,
                     belongs_to_class=self.current_class,
                 ),
             }
             self.generic_visit(node)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_Assign(self, node):
             if self.current_class is not None:
