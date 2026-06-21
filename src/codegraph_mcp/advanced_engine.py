@@ -1,15 +1,9 @@
-# import numpy as np
-# import networkx as nx
-# from typing import List, Dict, Any, Tuple
-# import ast
-
 import numpy as np
 import networkx as nx
-from typing import List, Dict, Any, Tuple
-import json
+from typing import List, Dict, Any
 import re
 
-from fileParsing.scanAST import build_semantic_skeleton
+from codegraph_mcp.file_parsing.scanAST import build_semantic_skeleton
 
 SEARCH_RESULT_LIMIT = 2
 SEMANTIC_POOL_SIZE = 50

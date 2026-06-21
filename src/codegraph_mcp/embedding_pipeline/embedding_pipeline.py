@@ -1,7 +1,3 @@
-import json
-from pathlib import Path
-import networkx as nx
-from typing import List, Dict, Any
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import sys
 import torch
@@ -82,7 +78,6 @@ class EmbeddingModelLifecycleManager:
                 self.active_tasks = 0
                 gc.collect()
                 try:
-                    import torch
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     elif hasattr(torch, "mps") and torch.backends.mps.is_available():

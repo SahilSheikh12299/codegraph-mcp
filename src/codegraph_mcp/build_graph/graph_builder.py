@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import networkx as nx
-import json
 
 class CodeGraph:
     """An advanced directed property graph schema that manages files, classes,

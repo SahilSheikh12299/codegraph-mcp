@@ -4,9 +4,9 @@ import hashlib
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
-from ollama_client import OllamaError, generate_intent_docstring
+from codegraph_mcp.ollama_client import OllamaError, generate_intent_docstring
 
 def resolve_base_class_name(expr: ast.AST) -> str | None:
     """Extract the leaf class name from a base-class AST expression.

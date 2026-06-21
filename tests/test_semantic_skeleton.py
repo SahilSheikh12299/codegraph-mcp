@@ -1,12 +1,7 @@
 """Unit tests for AST semantic skeleton extraction used in cross-encoder reranking."""
 
-import sys
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).parent.resolve()))
-
-from fileParsing.scanAST import build_semantic_skeleton
-from advanced_engine import build_rerank_passage
+from codegraph_mcp.advanced_engine import build_rerank_passage
+from codegraph_mcp.file_parsing.scanAST import build_semantic_skeleton
 
 SAMPLE_FUNCTION = '''
 def resolve_redirects(self, resp, req, stream=False, timeout=None, verify=True, cert=None, proxies=None, yield_requests=False, **adapter_kwargs):
@@ -69,20 +64,3 @@ def test_build_rerank_passage_uses_skeleton():
     assert "Type: FUNCTION" in passage
     assert "Calls:" in passage
     assert "for r in resp.history" not in passage
-
-
-if __name__ == "__main__":
-    tests = [
-        test_function_skeleton_excludes_control_flow,
-        test_class_skeleton_includes_methods_not_bodies,
-        test_build_rerank_passage_uses_skeleton,
-    ]
-    failed = 0
-    for test in tests:
-        try:
-            test()
-            print(f"PASS: {test.__name__}")
-        except AssertionError as e:
-            failed += 1
-            print(f"FAIL: {test.__name__} — {e}")
-    sys.exit(1 if failed else 0)

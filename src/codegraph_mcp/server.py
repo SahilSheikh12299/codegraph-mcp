@@ -10,18 +10,18 @@ import networkx as nx
 from filelock import FileLock
 from mcp.server.fastmcp import FastMCP
 
-from fileParsing import extract_file_entities, WorkspaceScanner, ASTParser, ImportTracker
-from graph_io import GraphSerializer
-from embeddingPipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
-from ollama_client import unload_model
-from advanced_engine import (
+from codegraph_mcp.file_parsing import extract_file_entities, WorkspaceScanner, ASTParser, ImportTracker
+from codegraph_mcp.graph_io import GraphSerializer
+from codegraph_mcp.embedding_pipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
+from codegraph_mcp.ollama_client import unload_model
+from codegraph_mcp.advanced_engine import (
     AdvancedRetrievalEngine,
     recompute_call_centrality,
     build_grep_text,
     build_query_ranked_call_chain,
 )
-from markdown_format import format_multi_term_paths_markdown
-from buildGraph import (
+from codegraph_mcp.markdown_format import format_multi_term_paths_markdown
+from codegraph_mcp.build_graph import (
     wire_calls_for_file,
     build_func_registry_from_graph,
     strip_calls_edges,
@@ -33,7 +33,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
-mcp = FastMCP("Cursor-Graph-RAG-Engine")
+mcp = FastMCP("codegraph-mcp")
 model_manager = EmbeddingModelLifecycleManager()
 
 INTENT_DOC_SCHEMA = 1
@@ -608,5 +608,5 @@ def search_codebase_intent(
         if embedder is not None:
             model_manager.release()
 
-if __name__ == "__main__":
+def run_server() -> None:
     mcp.run(transport="stdio")

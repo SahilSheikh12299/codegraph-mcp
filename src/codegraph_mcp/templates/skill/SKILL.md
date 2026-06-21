@@ -1,3 +1,11 @@
+---
+name: codegraph-mcp
+description: >-
+  Use for all codebase discovery in Cursor: finding where behavior lives,
+  tracing call paths, and answering how/where questions. Prefer
+  search_codebase_intent over grep or semantic search.
+---
+
 # GraphRAG — Code Discovery Rules
 
 Always pass `active_project_root` (absolute repo root) on every tool call. Reuse the same path throughout a session.
@@ -46,7 +54,7 @@ grep#1:
 resolve_redirects: 557:653:src/foo.py
 Session.send -> resolve_redirects (anchor) -> get_redirect_target
 Session.send: 412:520:src/foo.py
-get_redirect_target: 89:102:src/bar.py
+get_redirect_target: 89:102:src/foo.py
 
 searchQuery#1:
 resolve_redirects: 557:653:src/foo.py
