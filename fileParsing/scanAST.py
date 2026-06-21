@@ -2,10 +2,30 @@ import ast
 import copy
 import hashlib
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from ollama_client import OllamaError, generate_intent_docstring
+
+def resolve_base_class_name(expr: ast.AST) -> str | None:
+    """Extract the leaf class name from a base-class AST expression.
+
+    Examples:
+        BaseModel -> BaseModel
+        abc.ABC -> ABC
+        typing.Generic[T] -> Generic
+        pkg.models.User -> User
+    """
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        return expr.attr
+    if isinstance(expr, ast.Subscript):
+        return resolve_base_class_name(expr.value)
+    if isinstance(expr, ast.Call):
+        return resolve_base_class_name(expr.func)
+    return None
 
 class ASTParser:
     """Parses a single Python file using the native AST module to extract
@@ -62,6 +82,11 @@ class ASTParser:
                     "docstring": ast.get_docstring(node) or "",  # <--- FIXED
                     "line_span": (node.lineno, node.end_lineno),
                     "bases": [self._get_source_segment(base) for base in node.bases],
+                    "base_names": [
+                        name
+                        for base in node.bases
+                        if (name := resolve_base_class_name(base))
+                    ],
                     "methods": self._extract_methods(node)  # Make sure your internal _extract_methods also pulls sub_node docstrings!
                 }
                 classes.append(class_meta)
@@ -196,6 +221,9 @@ def _should_auto_docstrings() -> bool:
     return val not in ("0", "false", "no", "off")
 
 
+_ollama_failure_logged = False
+
+
 def _auto_docstring_for_function(
     *,
     function_name: str,
@@ -205,6 +233,7 @@ def _auto_docstring_for_function(
     model: str,
     timeout_s: float,
 ) -> str:
+    global _ollama_failure_logged
     cached = (doc_cache or {}).get(body_hash)
     if cached:
         return cached
@@ -220,7 +249,14 @@ def _auto_docstring_for_function(
             model=model,
             timeout_s=timeout_s,
         )
-    except OllamaError:
+    except OllamaError as e:
+        if not _ollama_failure_logged:
+            print(
+                f"[Docstrings] Ollama failed ({function_name}): {e}; "
+                "skipping remaining auto-docstrings.",
+                file=sys.stderr,
+            )
+            _ollama_failure_logged = True
         return ""
 
     if doc:

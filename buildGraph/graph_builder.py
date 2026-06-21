@@ -408,7 +408,8 @@ class RepositoryGraphCompiler:
             for cls in assets.get("classes", []):
                 class_id = f"{file_path}::{cls['name']}"
                 
-                for base_class_name in cls.get("bases", []):
+                base_names = cls.get("base_names") or []
+                for base_class_name in base_names:
                     # Scenario A: Parent class is defined inside the exact same file
                     local_match = f"{file_path}::{base_class_name}"
                     if self.cg.graph.has_node(local_match):

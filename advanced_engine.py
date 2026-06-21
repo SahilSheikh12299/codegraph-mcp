@@ -62,41 +62,6 @@ def compute_keyword_score(data: Dict[str, Any], keywords: List[str]) -> float:
     return hits / max_possible if max_possible else 0.0
 
 
-def extract_source_excerpt(
-    chunk_text: str,
-    node_type: str = "FUNCTION",
-    max_lines: int = SOURCE_EXCERPT_MAX_LINES,
-) -> str:
-    """Capped source: first max_lines, plus return line(s) if truncated."""
-    if not chunk_text:
-        return ""
-
-    lines = chunk_text.splitlines()
-    if not lines:
-        return ""
-
-    if node_type == "CLASS":
-        excerpt = lines[:max_lines]
-        if len(lines) > max_lines:
-            excerpt.append(f"# ... truncated ({len(lines)} lines total)")
-        return "\n".join(excerpt)
-
-    head = lines[:max_lines]
-    tail_returns: list[str] = []
-    for ln in lines[max_lines:]:
-        stripped = ln.lstrip()
-        if stripped.startswith("return ") or stripped == "return":
-            tail_returns.append(ln)
-            if len(tail_returns) >= 3:
-                break
-
-    parts = list(head)
-    if len(lines) > max_lines:
-        parts.append(f"# ... truncated ({len(lines)} lines total)")
-    parts.extend(tail_returns)
-    return "\n".join(parts)
-
-
 def build_rerank_passage(data: Dict[str, Any]) -> str:
     """Compact embedding metadata + AST semantic skeleton for cross-encoder reranking."""
     meta = (data.get("embedding_text") or "").strip()
@@ -120,38 +85,6 @@ _NON_PYTHON_PATH_HINTS = [
     "HISTORY.*",
     "CHANGELOG.*",
 ]
-
-
-def graph_coverage_fields(G: nx.DiGraph) -> dict[str, Any]:
-    file_nodes = [d for _, d in G.nodes(data=True) if d.get("type") == "FILE"]
-    return {
-        "python_only": True,
-        "python_files_indexed": len(file_nodes),
-        "last_indexed_at": G.graph.get("last_synced_at"),
-        "missing_paths": [],
-        "non_python_paths_relevant": list(_NON_PYTHON_PATH_HINTS),
-    }
-
-
-def discovery_sufficiency_fields(has_hits: bool) -> dict[str, Any]:
-    """Search/grep responses: discovery only — never claim native read is forbidden."""
-    if has_hits:
-        return {
-            "sufficient_for": ["discovery"],
-            "sufficient_to_answer": True,
-            "sufficient_to_answer_reason": (
-                "Bucketed node metadata returned. For behavior use fetch_node_source; "
-                "for edit planning use fetch_node_metadata or plan_feature_touch_set."
-            ),
-            "do_not_use_native_read": False,
-        }
-    return {
-        "sufficient_for": [],
-        "sufficient_to_answer": False,
-        "sufficient_to_answer_reason": "No graph matches; native grep/read may be needed.",
-        "do_not_use_native_read": False,
-    }
-
 
 def build_grep_text(data: Dict[str, Any]) -> str:
     """Compact searchable text for literal grep-replica (no chunk_text)."""
@@ -577,31 +510,6 @@ def grep_search_nodes(
     ]
 
 
-def get_call_neighbors(G: nx.DiGraph, node_id: str, limit: int = 5) -> Tuple[List[str], List[str]]:
-    """Return 1-hop CALLS predecessors (callers) and successors (callees)."""
-    if not G.has_node(node_id):
-        return [], []
-    callers = [
-        p for p in G.predecessors(node_id)
-        if G.edges[p, node_id].get("relationship") == "CALLS"
-    ]
-    callees = [
-        s for s in G.successors(node_id)
-        if G.edges[node_id, s].get("relationship") == "CALLS"
-    ]
-    return sorted(callers)[:limit], sorted(callees)[:limit]
-
-
-def format_call_neighbors(G: nx.DiGraph, node_id: str, limit: int = 5) -> str:
-    callers, callees = get_call_neighbors(G, node_id, limit)
-    lines = []
-    if callers:
-        lines.append(f"- called_by: {', '.join(f'`{c}`' for c in callers)}")
-    if callees:
-        lines.append(f"- calls: {', '.join(f'`{c}`' for c in callees)}")
-    return "\n".join(lines)
-
-
 def recompute_call_centrality(G: nx.DiGraph) -> None:
     """CALLS in-degree per CLASS/FUNCTION node, normalized to call_centrality in [0, 1]."""
     code_nodes = {
@@ -636,29 +544,6 @@ class AdvancedRetrievalEngine:
         self.embedder = embedder_instance
         self.reranker = reranker
 
-    def _extract_tiny_slice(self, chunk_text: str, max_lines: int = 8) -> str:
-        """Returns signature + first lines of actual body logic (skips docstring/comments)."""
-        if not chunk_text:
-            return ""
-        lines = [ln.rstrip() for ln in chunk_text.strip().splitlines() if ln.strip()]
-        if not lines:
-            return ""
-        result = [lines[0]]
-        in_docstring = False
-        body_lines = 0
-        for ln in lines[1:]:
-            s = ln.strip()
-            if s.startswith('"""') or s.startswith("'''"):
-                in_docstring = not in_docstring
-                continue
-            if in_docstring or s.startswith("#"):
-                continue
-            result.append(ln)
-            body_lines += 1
-            if body_lines >= max_lines - 1:
-                break
-        return "\n".join(result)
-
     def _calculate_cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
         """Computes the standard cosine similarity between two normalized vectors."""
         a = np.array(vec_a)
@@ -676,26 +561,6 @@ class AdvancedRetrievalEngine:
             return 0.0
         return float(dot_product / (norm_a * norm_b))
     
-    def _execute_cliff_detection(self, scored_hits: List[Tuple[str, Dict[str, Any], float, str]], 
-                                 min_k: int = 2, max_k: int = 5, sensitivity: float = 0.05) -> int:
-        """Analyzes similarity drop-offs mathematically to identify either sharp cliffs
-        or relative plateaus of relevancy, returning a dynamic cutoff index.
-        """
-        if len(scored_hits) <= min_k:
-            return len(scored_hits)
-            
-        limit = min(len(scored_hits), max_k)
-        
-        for i in range(min_k - 1, limit - 1):
-            current_score = scored_hits[i][2]
-            next_score = scored_hits[i + 1][2]
-            delta = current_score - next_score
-            
-            if delta >= sensitivity:
-                return i + 1
-                
-        return limit
-
     def run_hybrid_retrieval(
         self,
         search_queries: List[str],
@@ -780,116 +645,6 @@ class AdvancedRetrievalEngine:
             for hit in final_selections
         ]
 
-    def compute_upstream_blast_radius(self, target_nodes: List[str]) -> List[Dict[str, Any]]:
-        """Traverses the directional edges of the network graph upward to trace
-        every entity that will break if the target nodes are modified.
-        """
-        all_affected_nodes = set()
-        
-        for node_id in target_nodes:
-            if self.G.has_node(node_id):
-                upstream_ancestors = nx.ancestors(self.G, node_id)
-                all_affected_nodes.update(upstream_ancestors)
-
-        affected_profiles = []
-        for node_id in all_affected_nodes:
-            data = self.G.nodes[node_id]
-            if "type" not in data:
-                continue
-            affected_profiles.append({
-                "node_id": node_id,
-                "type": data.get("type"),
-                "name": data.get("name"),
-                "file_path": data.get("file_path"),
-                "signature": data.get("signature", "")
-            })
-            
-        return affected_profiles
-
-    def compile_context_package(
-        self,
-        search_queries: List[str],
-        # targeted_symbols: List[str] = None,
-        top_k: int | None = None,
-        output_format: str = "json",
-    ) -> str:
-        """Multi-query hybrid retrieval. Returns metadata only (no source excerpts)."""
-        keywords = extract_keywords_from_queries(search_queries)
-        query_hits = self.run_hybrid_retrieval(search_queries, keywords=keywords)
-
-        if not query_hits:
-            if output_format == "json":
-                return json.dumps(
-                    {"queries": search_queries, "candidates": [], "message": "No matches found."},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            return "### [Graph-RAG System Message]\nNo relevant structural context matched this query matrix."
-
-        limit = SEARCH_RESULT_LIMIT if top_k is None else max(1, int(top_k))
-        final_seeds = query_hits[:limit]
-
-        def _json_dumps(obj: Any) -> str:
-            return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
-
-        def _neighbor_ids(nid: str) -> dict[str, list[str]]:
-            return rank_call_neighbors(
-                self.G,
-                nid,
-                search_queries,
-                embedder=self.embedder,
-                reranker=self.reranker,
-                limit=NEIGHBOR_ID_LIMIT,
-            )
-
-        if output_format == "json":
-            candidates: list[dict[str, Any]] = []
-            for hit in final_seeds:
-                meta = hit["metadata"]
-                node_id = hit["node_id"]
-                candidate = format_search_candidate(
-                    self.G,
-                    node_id,
-                    meta,
-                    score=hit["hybrid_score"],
-                )
-                candidates.append(candidate)
-
-            has_hits = bool(candidates)
-            out: dict[str, Any] = {
-                "queries": search_queries,
-                "keywords": keywords,
-                "candidates": candidates,
-                "graph_coverage": graph_coverage_fields(self.G),
-                **discovery_sufficiency_fields(has_hits),
-            }
-            return _json_dumps(out)
-
-        markdown = "## Codebase Search Results\n\n"
-        markdown += f"Queries: {', '.join(search_queries)}\n"
-        markdown += (
-            f"Showing top {len(final_seeds)} matches. "
-            f"Stage 1: {STAGE1_SEMANTIC_WEIGHT}×semantic + {STAGE1_KEYWORD_WEIGHT}×keywords (top {STAGE1_POOL_SIZE}); "
-            f"Stage 2: cross-encoder rerank.\n\n"
-        )
-
-        for idx, hit in enumerate(final_seeds, 1):
-            meta = hit["metadata"]
-            node_id = hit["node_id"]
-            neighbors = _neighbor_ids(node_id)
-
-            markdown += f"### Hit {idx}: `{node_id}`\n"
-            markdown += f"- score: {hit['hybrid_score']:.4f} | callers: {hit['callers']}\n"
-            markdown += f"- type: {meta.get('type')}\n"
-            markdown += f"- signature: {meta.get('signature', '()')}\n"
-            emb = (meta.get("embedding_text") or "").strip()
-            if emb:
-                markdown += f"- embedding_text: {emb}\n"
-            markdown += f"- neighbors: callers={len(neighbors['callers'])}, callees={len(neighbors['callees'])}\n"
-            markdown += "\n"
-
-        return markdown
-
     def compile_bucketed_context_package(
         self,
         search_queries: List[str],
@@ -957,7 +712,7 @@ class AdvancedRetrievalEngine:
             "rewritten_queries": queries,
             "grep_terms": grep_terms,
             "semantic_by_query": semantic_by_query,
-            "semantic_bucket": {"nodes": semantic_nodes},
+            # "semantic_bucket": {"nodes": semantic_nodes},
             "grep_buckets": grep_buckets,
         }
 

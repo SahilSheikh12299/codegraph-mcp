@@ -14,27 +14,6 @@ class GraphSerializer:
 
     along with the serialization and de-serialization of codebase graphs.
     """
-
-    @staticmethod
-    def get_global_storage_dir() -> Path:
-        """Returns and creates the centralized, hidden global tool storage cache folder."""
-        storage_dir = Path("~/.cursor_graph_rag/storage").expanduser()
-        storage_dir.mkdir(parents=True, exist_ok=True)
-        return storage_dir
-
-    # @staticmethod
-    # def get_graph_path_for_workspace(workspace_path: str | Path) -> Path:
-    #     """Generates a deterministic SHA-256 hash from an absolute workspace path
-
-    #     to guarantee unique file identification without naming collisions.
-    #     """
-    #     abs_path_str = str(Path(workspace_path).resolve())
-    #     # Generate a distinct cryptographic hash of the file system path string
-    #     path_hash = hashlib.sha256(abs_path_str.encode("utf-8")).hexdigest()
-        
-    #     storage_dir = GraphSerializer.get_global_storage_dir()
-    #     return storage_dir / f"{path_hash}.json"
-
     @staticmethod
     def save_to_json(G: nx.DiGraph, workspace_path: str | Path, graph_path: str | Path) -> Path:
         """Converts a working NetworkX graph into standard node-link data schemas

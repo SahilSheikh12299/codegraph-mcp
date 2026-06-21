@@ -26,39 +26,6 @@ class LocalEmbeddingPipeline:
         self.model = SentenceTransformer(model_name)
         print("[Embedding Engine] Model loaded successfully and ready for encoding.")
 
-    def embed_graph_nodes(self, graph: nx.DiGraph) -> int:
-        """Extracts text chunks from all nodes, encodes them in optimized batches,
-
-        and binds the resulting vector arrays back into the graph properties.
-        """
-        nodes_to_encode = []
-        texts_to_encode = []
-
-        for node_id, data in graph.nodes(data=True):
-            text = (data.get("embedding_text") or data.get("chunk_text") or "").strip()
-            if text:
-                nodes_to_encode.append(node_id)
-                texts_to_encode.append(text)
-
-        if not texts_to_encode:
-            print("[Warning] No text chunks discovered in the graph.")
-            return 0
-
-        print(f"[Embedding Engine] Batch encoding {len(texts_to_encode)} chunks...")
-        
-        embeddings = self.model.encode(
-            texts_to_encode, 
-            batch_size=32, 
-            show_progress_bar=True,
-            convert_to_numpy=True
-        )
-
-        print("[Embedding Engine] Mapping vectorized footprints back into NetworkX nodes...")
-        for node_id, embedding_array in zip(nodes_to_encode, embeddings):
-            graph.nodes[node_id]["embedding"] = embedding_array.tolist()
-
-        return len(nodes_to_encode)
-
 
 class EmbeddingModelLifecycleManager:
     """Thread-safe on-demand lifecycle manager for heavy deep learning models."""

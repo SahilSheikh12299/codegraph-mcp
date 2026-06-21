@@ -462,11 +462,6 @@ def sync_embeddings_and_graph(
     return dirty
 
 
-def execute_preflight_lazy_sync(repo_root: Path, G: nx.DiGraph, embedder: LocalEmbeddingPipeline) -> bool:
-    """Legacy wrapper: docstrings should run via sync_docstrings before loading embedder."""
-    return sync_embeddings_and_graph(repo_root, G, embedder)
-
-
 # =========================================================================
 # Term-scoped matches: top-2 per grep term + top-2 per search query
 # =========================================================================
@@ -612,14 +607,6 @@ def search_codebase_intent(
     finally:
         if embedder is not None:
             model_manager.release()
-
-
-# =========================================================================
-# Legacy MCP tools (removed — search + native Read only)
-# =========================================================================
-# grep_graph_nodes, repo_references, fetch_node_metadata, fetch_node_source,
-# fetch_snippets, plan_feature_touch_set, calculate_blast_radius, trace_callers
-
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

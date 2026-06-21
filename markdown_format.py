@@ -20,13 +20,6 @@ def cite_ref(file_path: str | None, start: int | None, end: int | None) -> str:
     return f"{start}:{end}:{file_path}"
 
 
-def format_error(message: str, example: str = "") -> str:
-    lines = [f"## Error\n\n{message}"]
-    if example:
-        lines.append(f"\nExample:\n{example}")
-    return "\n".join(lines)
-
-
 def _display_name(entry: dict[str, Any]) -> str:
     return entry.get("name") or short_name(entry.get("node_id", ""))
 
@@ -41,64 +34,6 @@ def _role_label(name: str, role: str) -> str:
     if role == "downstream":
         return f"{name} (downstream)"
     return name
-
-
-def format_micro_search_markdown(
-    *,
-    queries: list[str],
-    grep_terms: list[str],
-    anchor: dict[str, Any] | None,
-    path: list[dict[str, Any]],
-    read_next: list[str],
-) -> str:
-    """Micro search: 1 anchor + ordered path + up to 3 read-next cite spans."""
-    if not anchor:
-        q = ", ".join(queries) if queries else "(none)"
-        terms = ", ".join(grep_terms) if grep_terms else ""
-        hint = f" and symbols: {terms}" if terms else ""
-        return (
-            f"## Search\n\n"
-            f"No graph matches for: {q}{hint}\n\n"
-            f"Refine `search_queries` or `grep_terms` and call search again."
-        )
-
-    lines = ["## Search", ""]
-    if queries:
-        lines.append(f"Queries: {', '.join(queries)}")
-    if grep_terms:
-        lines.append(f"Symbols: {', '.join(grep_terms)}")
-    lines.append("")
-
-    name = _display_name(anchor)
-    ref = cite_ref(anchor.get("file_path"), anchor.get("start_line"), anchor.get("end_line"))
-    lines.append("### Anchor")
-    lines.append(f"- {name} — `{ref}`")
-    sig = (anchor.get("signature") or "").strip()
-    if sig:
-        lines.append(f"- signature: {sig}")
-    lines.append("")
-
-    lines.append("### Path")
-    if path:
-        for idx, step in enumerate(path, 1):
-            step_name = _display_name(step)
-            step_ref = cite_ref(
-                step.get("file_path"), step.get("start_line"), step.get("end_line")
-            )
-            label = _role_label(step_name, step.get("role", ""))
-            lines.append(f"{idx}. {label} → `{step_ref}`")
-    else:
-        lines.append(f"1. {_role_label(name, 'anchor')} → `{ref}`")
-    lines.append("")
-
-    lines.append("### Read next")
-    if read_next:
-        for idx, span in enumerate(read_next, 1):
-            lines.append(f"{idx}. `{span}`")
-    else:
-        lines.append(f"1. `{ref}`")
-
-    return "\n".join(lines).rstrip()
 
 
 def _chain_pick(chain: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
@@ -214,17 +149,3 @@ def format_multi_term_paths_markdown(
         _emit_block(f"searchQuery#{idx}", (bucket.get("matches") or [])[:2])
 
     return "\n".join(lines).rstrip()
-
-
-# ---------------------------------------------------------------------------
-# Legacy formatters (unused — kept for reference)
-# ---------------------------------------------------------------------------
-# def cursor_citation(...): ...
-# def format_search_markdown(...): ...
-# def format_grep_markdown(...): ...
-# def format_snippets_markdown(...): ...
-# def format_source_markdown(...): ...
-# def format_metadata_markdown(...): ...
-# def format_touch_set_markdown(...): ...
-# def format_repo_refs_markdown(...): ...
-# def format_blast_radius_markdown(...): ...
