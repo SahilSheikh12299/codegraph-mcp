@@ -27,6 +27,18 @@ def resolve_base_class_name(expr: ast.AST) -> str | None:
         return resolve_base_class_name(expr.func)
     return None
 
+def read_python_ast(path: str | Path) -> tuple[str, ast.Module] | None:
+    """Read a Python file once and return (source, tree), or None on I/O/syntax errors."""
+    full_path = Path(path).resolve()
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=str(full_path))
+        return source, tree
+    except (UnicodeDecodeError, SyntaxError, OSError):
+        return None
+
+
 class ASTParser:
     """Parses a single Python file using the native AST module to extract
 
@@ -36,24 +48,46 @@ class ASTParser:
     def __init__(self, file_path: str | Path):
         self.file_path = Path(file_path).resolve()
 
-    def parse(self) -> Dict[str, Any]:
+    def parse(
+        self,
+        *,
+        source: str | None = None,
+        tree: ast.Module | None = None,
+    ) -> Dict[str, Any]:
         """Reads the source file, compiles the AST, and extracts structural metadata."""
-        try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                source_code = f.read()
-            
-            # Compile the raw text into a syntax tree
-            tree = ast.parse(source_code, filename=str(self.file_path))
-        except (UnicodeDecodeError, SyntaxError) as e:
-            return {
-                "file_path": str(self.file_path),
-                "error": f"Failed to parse: {str(e)}",
-                "docstring": "",
-                "classes": [],
-                "functions": [],
-                "globals": [],
-                "top_level_calls": []
-            }
+        if tree is not None:
+            source_code = source or ""
+        elif source is not None:
+            source_code = source
+            try:
+                tree = ast.parse(source_code, filename=str(self.file_path))
+            except SyntaxError as e:
+                return {
+                    "file_path": str(self.file_path),
+                    "error": f"Failed to parse: {str(e)}",
+                    "docstring": "",
+                    "classes": [],
+                    "functions": [],
+                    "globals": [],
+                    "top_level_calls": [],
+                }
+        else:
+            try:
+                with open(self.file_path, "r", encoding="utf-8") as f:
+                    source_code = f.read()
+
+                # Compile the raw text into a syntax tree
+                tree = ast.parse(source_code, filename=str(self.file_path))
+            except (UnicodeDecodeError, SyntaxError) as e:
+                return {
+                    "file_path": str(self.file_path),
+                    "error": f"Failed to parse: {str(e)}",
+                    "docstring": "",
+                    "classes": [],
+                    "functions": [],
+                    "globals": [],
+                    "top_level_calls": [],
+                }
 
         # EXTRACT FILE/MODULE LEVEL DOCSTRING
         file_docstring = ast.get_docstring(tree) or ""
@@ -454,6 +488,8 @@ def extract_file_entities(
     ollama_model: str = "qwen2.5:1.5b",
     ollama_timeout_s: float = 20.0,
     enable_auto_docstrings: bool | None = None,
+    source: str | None = None,
+    tree: ast.Module | None = None,
 ) -> dict:
     """Parses a python file using its absolute path, but labels the nodes
 
@@ -462,15 +498,21 @@ def extract_file_entities(
     full_path = repo_root / rel_path
     if not full_path.exists():
         return {}
-        
-    with open(full_path, "r", encoding="utf-8") as f:
-        source = f.read()
-        
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as e:
-        print(f"  [Parser Error] Syntax error while reading {rel_path}: {e}")
-        return {}
+
+    if tree is None:
+        with open(full_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        try:
+            tree = ast.parse(source, filename=str(full_path))
+        except SyntaxError as e:
+            print(f"  [Parser Error] Syntax error while reading {rel_path}: {e}")
+            return {}
+    elif source is None:
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                source = f.read()
+        except OSError:
+            return {}
         
     entities = {}
     cache: dict[str, str] = doc_cache if doc_cache is not None else {}

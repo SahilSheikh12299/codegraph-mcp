@@ -10,7 +10,7 @@ import networkx as nx
 from filelock import FileLock
 from mcp.server.fastmcp import FastMCP
 
-from codegraph_mcp.file_parsing import extract_file_entities, WorkspaceScanner, ASTParser, ImportTracker
+from codegraph_mcp.file_parsing import extract_file_entities, WorkspaceScanner, ASTParser, ImportTracker, read_python_ast
 from codegraph_mcp.graph_io import GraphSerializer
 from codegraph_mcp.embedding_pipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
 from codegraph_mcp.ollama_client import unload_model
@@ -203,10 +203,27 @@ def _embed_file_nodes(G: nx.DiGraph, rel_path: str, embedder: LocalEmbeddingPipe
     return len(texts_to_encode)
 
 
-def _parse_file_call_assets(repo_root: Path, rel_path: str, tracker: ImportTracker) -> dict:
+def _parse_file_call_assets(
+    repo_root: Path,
+    rel_path: str,
+    tracker: ImportTracker,
+    *,
+    source: str | None = None,
+    tree: Any | None = None,
+) -> dict:
     full_path = repo_root / rel_path
-    ast_data = ASTParser(file_path=full_path).parse()
-    import_data = tracker.get_dependencies(full_path)
+    if source is None or tree is None:
+        parsed = read_python_ast(full_path)
+        if parsed is None:
+            return {
+                "classes": [],
+                "functions": [],
+                "top_level_calls": [],
+                "internal_imports": [],
+            }
+        source, tree = parsed
+    ast_data = ASTParser(file_path=full_path).parse(source=source, tree=tree)
+    import_data = tracker.get_dependencies(full_path, tree=tree)
     return {
         "classes": ast_data.get("classes", []),
         "functions": ast_data.get("functions", []),
@@ -229,16 +246,41 @@ def _rewire_all_calls(
     tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
     for rel_path in sorted(tracked):
         if (repo_root / rel_path).exists():
+            full_path = repo_root / rel_path
+            parsed = read_python_ast(full_path)
+            if parsed is None:
+                continue
+            source, tree = parsed
             wire_calls_for_file(
-                G, rel_path, _parse_file_call_assets(repo_root, rel_path, tracker), registry
+                G,
+                rel_path,
+                _parse_file_call_assets(
+                    repo_root, rel_path, tracker, source=source, tree=tree
+                ),
+                registry,
             )
     recompute_call_centrality(G)
 
 
-def _rewire_file_calls(G: nx.DiGraph, repo_root: Path, rel_path: str, tracker: ImportTracker) -> None:
+def _rewire_file_calls(
+    G: nx.DiGraph,
+    repo_root: Path,
+    rel_path: str,
+    tracker: ImportTracker,
+    *,
+    source: str | None = None,
+    tree: Any | None = None,
+) -> None:
     strip_calls_edges_for_file(G, rel_path)
     registry = build_func_registry_from_graph(G)
-    wire_calls_for_file(G, rel_path, _parse_file_call_assets(repo_root, rel_path, tracker), registry)
+    wire_calls_for_file(
+        G,
+        rel_path,
+        _parse_file_call_assets(
+            repo_root, rel_path, tracker, source=source, tree=tree
+        ),
+        registry,
+    )
     recompute_call_centrality(G)
 
 
@@ -428,7 +470,19 @@ def sync_embeddings_and_graph(
                 for node_id, data in G.nodes(data=True)
                 if data.get("file_path") == rel_path
             }
-            fresh_entities = extract_file_entities(rel_path, repo_root, enable_auto_docstrings=False)
+            parsed = read_python_ast(full_path)
+            if parsed is None:
+                G.graph["indexed_timestamps"][rel_path] = current_mtime
+                dirty = True
+                continue
+            source, tree = parsed
+            fresh_entities = extract_file_entities(
+                rel_path,
+                repo_root,
+                enable_auto_docstrings=False,
+                source=source,
+                tree=tree,
+            )
 
             for node_id, fresh_data in fresh_entities.items():
                 if node_id in existing_file_nodes:
@@ -468,7 +522,9 @@ def sync_embeddings_and_graph(
 
             if import_tracker is None:
                 import_tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
-            _rewire_file_calls(G, repo_root, rel_path, import_tracker)
+            _rewire_file_calls(
+                G, repo_root, rel_path, import_tracker, source=source, tree=tree
+            )
 
     if calls_graph_changed:
         recompute_call_centrality(G)

@@ -28,15 +28,21 @@ class ImportTracker:
             except ValueError:
                 continue
 
-    def get_dependencies(self, file_path: str | Path) -> Dict[str, Any]:
+    def get_dependencies(
+        self,
+        file_path: str | Path,
+        *,
+        tree: ast.Module | None = None,
+    ) -> Dict[str, Any]:
         """Parses a file's AST and resolves imports using the pre-computed file layout map."""
         file_path = Path(file_path).resolve()
-        
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                tree = ast.parse(f.read(), filename=str(file_path))
-        except (UnicodeDecodeError, SyntaxError) as e:
-            return {"internal_paths": [], "external_modules": [], "error": str(e)}
+
+        if tree is None:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    tree = ast.parse(f.read(), filename=str(file_path))
+            except (UnicodeDecodeError, SyntaxError) as e:
+                return {"internal_paths": [], "external_modules": [], "error": str(e)}
 
         internal_dependencies: Set[Path] = set()
         external_dependencies: Set[str] = set()

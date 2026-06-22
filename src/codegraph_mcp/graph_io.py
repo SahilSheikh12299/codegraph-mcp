@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
+from typing import Any
 import networkx as nx
 from networkx.readwrite import json_graph
-from codegraph_mcp.file_parsing import WorkspaceScanner, ImportTracker, ASTParser, extract_file_entities
+from codegraph_mcp.file_parsing import WorkspaceScanner, ImportTracker, ASTParser, extract_file_entities, read_python_ast
 from codegraph_mcp.build_graph import RepositoryGraphCompiler, CodeChunker
 
 
@@ -51,17 +52,23 @@ class GraphSerializer:
             tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
 
             evaluation_report = {}
-    
+            parsed_by_rel: dict[str, tuple[str, Any]] = {}
+
             for file_path in python_files:
                 repo_relative_path = str(file_path.relative_to(repo_root))
                 print(f"Analyzing: {repo_relative_path}...")
-                
+
+                parsed = read_python_ast(file_path)
+                if parsed is None:
+                    continue
+                source, tree = parsed
+                parsed_by_rel[repo_relative_path] = parsed
+
                 # Parse structural tokens
-                parser = ASTParser(file_path=file_path)
-                ast_data = parser.parse()
-                
+                ast_data = ASTParser(file_path=file_path).parse(source=source, tree=tree)
+
                 # Track import linkages seamlessly
-                import_data = tracker.get_dependencies(file_path)
+                import_data = tracker.get_dependencies(file_path, tree=tree)
                 
                 evaluation_report[repo_relative_path] = {
                     "classes": ast_data.get("classes", []),
@@ -84,10 +91,16 @@ class GraphSerializer:
 
             for file_path in python_files:
                 repo_relative_path = str(file_path.relative_to(repo_root))
+                parsed = parsed_by_rel.get(repo_relative_path)
+                if parsed is None:
+                    continue
+                source, tree = parsed
                 for node_id, data in extract_file_entities(
                     repo_relative_path,
                     repo_root,
                     enable_auto_docstrings=False,
+                    source=source,
+                    tree=tree,
                 ).items():
                     if G.has_node(node_id):
                         G.nodes[node_id]["chunk_text"] = data["chunk_text"]
