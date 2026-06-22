@@ -28,7 +28,7 @@ ollama pull qwen2.5:1.5b
 # 2. Install codegraph-mcp (once)
 python -m venv .venv
 source .venv/bin/activate
-pip install "git+https://github.com/sahilsheikh/codegraph-mcp.git"
+pip install "git+https://github.com/SahilSheikh12299/codegraph-mcp.git"
 
 # 3. Global setup (once)
 codegraph-mcp setup
@@ -43,7 +43,7 @@ No per-project configuration needed.
 ## Pinned install
 
 ```bash
-pip install "git+https://github.com/sahilsheikh/codegraph-mcp.git@v0.1.0"
+pip install "git+https://github.com/SahilSheikh12299/codegraph-mcp.git@v0.1.0"
 ```
 
 ## Usage
@@ -82,7 +82,7 @@ Returns markdown with up to **2 matches per grep term and per search query**: an
 ## Development
 
 ```bash
-git clone https://github.com/sahilsheikh/codegraph-mcp.git
+git clone https://github.com/SahilSheikh12299/codegraph-mcp.git
 cd codegraph-mcp
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"

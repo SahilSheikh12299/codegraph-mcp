@@ -70,7 +70,7 @@ def _resolve_command() -> str:
         return cmd
     raise SystemExit(
         "codegraph-mcp is not on PATH. Install with:\n"
-        '  pip install "git+https://github.com/sahilsheikh/codegraph-mcp.git"\n'
+        '  pip install "git+https://github.com/SahilSheikh12299/codegraph-mcp.git"\n'
         "Then activate the same venv Cursor uses, or use the full path in ~/.cursor/mcp.json."
     )
 

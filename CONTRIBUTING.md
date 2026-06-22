@@ -23,5 +23,5 @@ git push origin v0.1.0
 Users install with:
 
 ```bash
-pip install "git+https://github.com/sahilsheikh/codegraph-mcp.git@v0.1.0"
+pip install "git+https://github.com/SahilSheikh12299/codegraph-mcp.git@v0.1.0"
 ```

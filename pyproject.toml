@@ -37,9 +37,9 @@ codegraph-mcp = "codegraph_mcp.cli:main"
 dev = ["pytest>=7.0", "build>=1.0"]
 
 [project.urls]
-Homepage = "https://github.com/sahilsheikh/codegraph-mcp"
-Repository = "https://github.com/sahilsheikh/codegraph-mcp"
-Issues = "https://github.com/sahilsheikh/codegraph-mcp/issues"
+Homepage = "https://github.com/SahilSheikh12299/codegraph-mcp"
+Repository = "https://github.com/SahilSheikh12299/codegraph-mcp"
+Issues = "https://github.com/SahilSheikh12299/codegraph-mcp/issues"
 
 [tool.hatch.build.targets.sdist]
 include = [

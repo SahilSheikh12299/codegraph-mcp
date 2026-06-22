@@ -572,7 +572,7 @@ class AdvancedRetrievalEngine:
 
         scored_hits: list[tuple[str, Dict[str, Any], float]] = []
         for node_id, data in self.G.nodes(data=True):
-            if "type" not in data:
+            if data.get("type") not in ("CLASS", "FUNCTION"):
                 continue
 
             node_vector = data.get("embedding")

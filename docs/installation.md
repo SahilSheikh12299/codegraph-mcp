@@ -39,19 +39,19 @@ Use a dedicated virtual environment (recommended):
 python -m venv ~/.venvs/codegraph-mcp
 source ~/.venvs/codegraph-mcp/bin/activate   # Windows: Scripts\activate
 pip install --upgrade pip
-pip install "git+https://github.com/sahilsheikh/codegraph-mcp.git"
+pip install "git+https://github.com/SahilSheikh12299/codegraph-mcp.git"
 ```
 
 Pinned to a release tag:
 
 ```bash
-pip install "git+https://github.com/sahilsheikh/codegraph-mcp.git@v0.1.0"
+pip install "git+https://github.com/SahilSheikh12299/codegraph-mcp.git@v0.1.0"
 ```
 
 Local development install:
 
 ```bash
-git clone https://github.com/sahilsheikh/codegraph-mcp.git
+git clone https://github.com/SahilSheikh12299/codegraph-mcp.git
 cd codegraph-mcp
 pip install -e ".[dev]"
 ```
