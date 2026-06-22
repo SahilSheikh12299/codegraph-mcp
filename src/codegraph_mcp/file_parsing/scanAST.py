@@ -4,7 +4,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict
 
 from codegraph_mcp.ollama_client import OllamaError, generate_intent_docstring
 
@@ -39,158 +39,124 @@ def read_python_ast(path: str | Path) -> tuple[str, ast.Module] | None:
         return None
 
 
-class ASTParser:
-    """Parses a single Python file using the native AST module to extract
+def _unparse_node(node: ast.AST) -> str:
+    """Convert an AST node back to its source string representation."""
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return "Unknown"
 
-    high-level code architecture entities.
-    """
 
-    def __init__(self, file_path: str | Path):
-        self.file_path = Path(file_path).resolve()
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
 
-    def parse(
-        self,
-        *,
-        source: str | None = None,
-        tree: ast.Module | None = None,
-    ) -> Dict[str, Any]:
-        """Reads the source file, compiles the AST, and extracts structural metadata."""
-        if tree is not None:
-            source_code = source or ""
-        elif source is not None:
-            source_code = source
-            try:
-                tree = ast.parse(source_code, filename=str(self.file_path))
-            except SyntaxError as e:
-                return {
-                    "file_path": str(self.file_path),
-                    "error": f"Failed to parse: {str(e)}",
-                    "docstring": "",
-                    "classes": [],
-                    "functions": [],
-                    "globals": [],
-                    "top_level_calls": [],
-                }
-        else:
-            try:
-                with open(self.file_path, "r", encoding="utf-8") as f:
-                    source_code = f.read()
 
-                # Compile the raw text into a syntax tree
-                tree = ast.parse(source_code, filename=str(self.file_path))
-            except (UnicodeDecodeError, SyntaxError) as e:
-                return {
-                    "file_path": str(self.file_path),
-                    "error": f"Failed to parse: {str(e)}",
-                    "docstring": "",
-                    "classes": [],
-                    "functions": [],
-                    "globals": [],
-                    "top_level_calls": [],
-                }
+def _extract_calls_from_body(body_nodes: list[ast.stmt]) -> list[str]:
+    """Collect called function/method names from a function body."""
+    called_names: set[str] = set()
+    for sub_node in ast.walk(ast.Module(body=body_nodes, type_ignores=[])):
+        if isinstance(sub_node, ast.Call):
+            name = _call_name(sub_node)
+            if name:
+                called_names.add(name)
+    return sorted(called_names)
 
-        # EXTRACT FILE/MODULE LEVEL DOCSTRING
-        file_docstring = ast.get_docstring(tree) or ""
 
-        classes: List[Dict[str, Any]] = []
-        functions: List[Dict[str, Any]] = []
-        globals_list: List[Dict[str, Any]] = []
-        top_level_calls: Set[str] = set()
+def _function_structure(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, Any]:
+    return {
+        "name": node.name,
+        "docstring": ast.get_docstring(node) or "",
+        "line_span": (node.lineno, node.end_lineno),
+        "arguments": [arg.arg for arg in node.args.args],
+        "is_async": isinstance(node, ast.AsyncFunctionDef),
+        "decorators": [_unparse_node(dec) for dec in node.decorator_list],
+        "calls": _extract_calls_from_body(node.body),
+    }
 
-        # Iterate through the top-level nodes of the file
-        for node in tree.body:
-            
-            # Extract root-level script execution calls
-            if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                for sub_node in ast.walk(node):
-                    if isinstance(sub_node, ast.Call):
-                        if isinstance(sub_node.func, ast.Name):
-                            top_level_calls.add(sub_node.func.id)
-                        elif isinstance(sub_node.func, ast.Attribute):
-                            top_level_calls.add(sub_node.func.attr)
 
-            # 1. Extract Top-Level Classes
-            if isinstance(node, ast.ClassDef):
-                class_meta = {
-                    "name": node.name,
-                    "docstring": ast.get_docstring(node) or "",  # <--- FIXED
+def _extract_class_methods(class_node: ast.ClassDef) -> list[dict[str, Any]]:
+    methods: list[dict[str, Any]] = []
+    for sub_node in class_node.body:
+        if isinstance(sub_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods.append({
+                "name": sub_node.name,
+                "line_span": (sub_node.lineno, sub_node.end_lineno),
+                "arguments": [arg.arg for arg in sub_node.args.args],
+                "is_async": isinstance(sub_node, ast.AsyncFunctionDef),
+                "calls": _extract_calls_from_body(sub_node.body),
+            })
+    return methods
+
+
+def _parse_structure(tree: ast.Module, *, file_path: Path) -> dict[str, Any]:
+    """Extract graph-compiler metadata from a module AST (top-level nodes only)."""
+    classes: list[dict[str, Any]] = []
+    functions: list[dict[str, Any]] = []
+    globals_list: list[dict[str, Any]] = []
+    top_level_calls: set[str] = set()
+
+    for node in tree.body:
+        if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            for sub_node in ast.walk(node):
+                if isinstance(sub_node, ast.Call):
+                    name = _call_name(sub_node)
+                    if name:
+                        top_level_calls.add(name)
+
+        if isinstance(node, ast.ClassDef):
+            classes.append({
+                "name": node.name,
+                "docstring": ast.get_docstring(node) or "",
+                "line_span": (node.lineno, node.end_lineno),
+                "bases": [_unparse_node(base) for base in node.bases],
+                "base_names": [
+                    name
+                    for base in node.bases
+                    if (name := resolve_base_class_name(base))
+                ],
+                "methods": _extract_class_methods(node),
+            })
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.append(_function_structure(node))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    globals_list.append({
+                        "name": target.id,
+                        "line_span": (node.lineno, node.end_lineno),
+                    })
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                globals_list.append({
+                    "name": node.target.id,
                     "line_span": (node.lineno, node.end_lineno),
-                    "bases": [self._get_source_segment(base) for base in node.bases],
-                    "base_names": [
-                        name
-                        for base in node.bases
-                        if (name := resolve_base_class_name(base))
-                    ],
-                    "methods": self._extract_methods(node)  # Make sure your internal _extract_methods also pulls sub_node docstrings!
-                }
-                classes.append(class_meta)
-
-            # 2. Extract Top-Level Functions
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_meta = {
-                    "name": node.name,
-                    "docstring": ast.get_docstring(node) or "",  # <--- FIXED
-                    "line_span": (node.lineno, node.end_lineno),
-                    "arguments": [arg.arg for arg in node.args.args],
-                    "is_async": isinstance(node, ast.AsyncFunctionDef),
-                    "decorators": [self._get_source_segment(dec) for dec in node.decorator_list],
-                    "calls": self._extract_calls_from_body(node.body)
-                }
-                functions.append(func_meta)
-
-            # 3. Extract Top-Level Global Variables
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        globals_list.append({"name": target.id, "line_span": (node.lineno, node.end_lineno)})
-            elif isinstance(node, ast.AnnAssign):
-                if isinstance(node.target, ast.Name):
-                    globals_list.append({"name": node.target.id, "line_span": (node.lineno, node.end_lineno)})
-
-        return {
-            "file_path": str(self.file_path),
-            "docstring": file_docstring,  # <--- FIXED
-            "classes": classes,
-            "functions": functions,
-            "globals": globals_list,
-            "top_level_calls": sorted(list(top_level_calls))
-        }
-    def _extract_methods(self, class_node: ast.ClassDef) -> List[Dict[str, Any]]:
-        """Helper to extract methods defined inside a specific class block."""
-        methods: List[Dict[str, Any]] = []
-        for sub_node in class_node.body:
-            if isinstance(sub_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                methods.append({
-                    "name": sub_node.name,
-                    "line_span": (sub_node.lineno, sub_node.end_lineno),  # <--- UPGRADED
-                    "arguments": [arg.arg for arg in sub_node.args.args],
-                    "is_async": isinstance(sub_node, ast.AsyncFunctionDef),
-                    "calls": self._extract_calls_from_body(sub_node.body),
                 })
-        return methods
-    # Add this helper method inside your ASTParser class
-    def _extract_calls_from_body(self, body_nodes: list[ast.stmt]) -> list[str]:
-        """Scans the inner statements of a function body to find called function/method names."""
-        called_names = set()
-        for sub_node in ast.walk(ast.Module(body=body_nodes, type_ignores=[])):
-            if isinstance(sub_node, ast.Call):
-                # Case A: Direct call (e.g., 'extract_cookies_to_jar(x)')
-                if isinstance(sub_node.func, ast.Name):
-                    called_names.add(sub_node.func.id)
-                # Case B: Attribute call (e.g., 'self.prepare_cookies()' or 'models.Response()')
-                elif isinstance(sub_node.func, ast.Attribute):
-                    called_names.add(sub_node.func.attr)
-        return sorted(list(called_names))
-        
-    def _get_source_segment(self, node: ast.AST) -> str:
-        """Helper to convert complex AST nodes (like nested decorators or base classes)
 
-        back into their original string representation.
-        """
-        try:
-            return ast.unparse(node)
-        except Exception:
-            return "Unknown"
+    return {
+        "file_path": str(file_path),
+        "docstring": ast.get_docstring(tree) or "",
+        "classes": classes,
+        "functions": functions,
+        "globals": globals_list,
+        "top_level_calls": sorted(top_level_calls),
+    }
+
+
+def _empty_parse_result(file_path: Path, *, error: str = "") -> dict[str, Any]:
+    return {
+        "file_path": str(file_path),
+        "error": error,
+        "docstring": "",
+        "classes": [],
+        "functions": [],
+        "globals": [],
+        "top_level_calls": [],
+        "entities": {},
+    }
 
 
 def build_embedding_text(
@@ -298,6 +264,205 @@ def _auto_docstring_for_function(
     return doc
 
 
+def _build_entities(
+    tree: ast.Module,
+    source: str,
+    rel_path: str,
+    *,
+    doc_cache: dict[str, str] | None,
+    enable_auto_docstrings: bool,
+    ollama_model: str,
+    ollama_timeout_s: float,
+) -> dict[str, dict[str, Any]]:
+    entities: dict[str, dict[str, Any]] = {}
+    cache = doc_cache if doc_cache is not None else {}
+
+    class _EntityVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.current_class: str | None = None
+            self.current_function: str | None = None
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            node_id = f"{rel_path}::{node.name}"
+            docstring = ast.get_docstring(node) or ""
+            bases = [_unparse_node(base) for base in node.bases]
+            entities[node_id] = {
+                "type": "CLASS",
+                "name": node.name,
+                "file_path": rel_path,
+                "chunk_text": ast.get_source_segment(source, node),
+                "line_span": (node.lineno, node.end_lineno or node.lineno),
+                "docstring": docstring,
+                "bases": bases,
+                "embedding_text": build_embedding_text(
+                    "CLASS", node.name, docstring=docstring, bases=bases
+                ),
+            }
+            old_class = self.current_class
+            self.current_class = node.name
+            self.generic_visit(node)
+            self.current_class = old_class
+
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            is_method = self.current_class is not None
+            if is_method:
+                node_id = f"{rel_path}::{self.current_class}.{node.name}"
+            else:
+                node_id = f"{rel_path}::{node.name}"
+
+            args = [arg.arg for arg in node.args.args]
+            signature = f"({', '.join(args)})"
+            native_docstring = ast.get_docstring(node) or ""
+            body_hash = _function_body_hash(node)
+            chunk_text = ast.get_source_segment(source, node) or ""
+
+            auto_docstring = ""
+            docstring_source = "native"
+            chosen_docstring = native_docstring
+            if not native_docstring and enable_auto_docstrings:
+                auto_docstring = _auto_docstring_for_function(
+                    function_name=node.name,
+                    chunk_text=chunk_text,
+                    doc_cache=cache,
+                    body_hash=body_hash,
+                    model=ollama_model,
+                    timeout_s=ollama_timeout_s,
+                )
+                if auto_docstring:
+                    chosen_docstring = auto_docstring
+                    docstring_source = "auto"
+                else:
+                    chosen_docstring = ""
+                    docstring_source = "none"
+
+            entities[node_id] = {
+                "type": "FUNCTION",
+                "name": node.name,
+                "file_path": rel_path,
+                "chunk_text": chunk_text,
+                "line_span": (node.lineno, node.end_lineno or node.lineno),
+                "signature": signature,
+                "docstring": chosen_docstring,
+                "auto_docstring": auto_docstring,
+                "docstring_source": docstring_source,
+                "body_hash": body_hash,
+                "is_method": is_method,
+                "belongs_to_class": self.current_class,
+                "embedding_text": build_embedding_text(
+                    "FUNCTION",
+                    node.name,
+                    docstring=chosen_docstring,
+                    belongs_to_class=self.current_class,
+                ),
+            }
+            old_function = self.current_function
+            self.current_function = node.name
+            self.generic_visit(node)
+            self.current_function = old_function
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if self.current_class is not None or self.current_function is not None:
+                return
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                node_id = f"{rel_path}::{target.id}"
+                entities[node_id] = {
+                    "type": "CONSTANT",
+                    "name": target.id,
+                    "file_path": rel_path,
+                    "chunk_text": ast.get_source_segment(source, node) or "",
+                    "line_span": (node.lineno, node.end_lineno or node.lineno),
+                    "signature": "",
+                    "embedding_text": build_embedding_text("CONSTANT", target.id),
+                }
+
+    _EntityVisitor().visit(tree)
+    return entities
+
+
+def parse_python_file(
+    file_path: str | Path,
+    *,
+    rel_path: str | None = None,
+    source: str | None = None,
+    tree: ast.Module | None = None,
+    build_entities: bool = False,
+    doc_cache: dict[str, str] | None = None,
+    ollama_model: str = "qwen2.5:1.5b",
+    ollama_timeout_s: float = 20.0,
+    enable_auto_docstrings: bool | None = None,
+) -> dict[str, Any]:
+    """Parse a Python file once for structural metadata and optional graph entities."""
+    full_path = Path(file_path).resolve()
+    entity_rel_path = rel_path or str(full_path)
+
+    if tree is not None:
+        source_code = source or ""
+    elif source is not None:
+        source_code = source
+        try:
+            tree = ast.parse(source_code, filename=str(full_path))
+        except SyntaxError as e:
+            return _empty_parse_result(full_path, error=f"Failed to parse: {e}")
+    else:
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                source_code = f.read()
+            tree = ast.parse(source_code, filename=str(full_path))
+        except (UnicodeDecodeError, SyntaxError, OSError) as e:
+            return _empty_parse_result(full_path, error=f"Failed to parse: {e}")
+
+    result = _parse_structure(tree, file_path=full_path)
+    result["entities"] = {}
+
+    if build_entities:
+        auto_enabled = (
+            _should_auto_docstrings()
+            if enable_auto_docstrings is None
+            else enable_auto_docstrings
+        )
+        result["entities"] = _build_entities(
+            tree,
+            source_code,
+            entity_rel_path,
+            doc_cache=doc_cache,
+            enable_auto_docstrings=auto_enabled,
+            ollama_model=ollama_model,
+            ollama_timeout_s=ollama_timeout_s,
+        )
+
+    return result
+
+
+class ASTParser:
+    """Backward-compatible wrapper around the unified module parser."""
+
+    def __init__(self, file_path: str | Path):
+        self.file_path = Path(file_path).resolve()
+
+    def parse(
+        self,
+        *,
+        source: str | None = None,
+        tree: ast.Module | None = None,
+    ) -> Dict[str, Any]:
+        result = parse_python_file(self.file_path, source=source, tree=tree)
+        if result.get("error"):
+            return {
+                "file_path": result["file_path"],
+                "error": result["error"],
+                "docstring": "",
+                "classes": [],
+                "functions": [],
+                "globals": [],
+                "top_level_calls": [],
+            }
+        return {k: v for k, v in result.items() if k != "entities"}
+
+
 _MAX_UNPARSE_LEN = 80
 _MAX_LIST_ITEMS = 30
 
@@ -312,14 +477,6 @@ def _unparse_expr(node: ast.AST | None, max_len: int = _MAX_UNPARSE_LEN) -> str:
     if len(text) > max_len:
         return text[: max_len - 3] + "..."
     return text
-
-
-def _call_name(call: ast.Call) -> str | None:
-    if isinstance(call.func, ast.Name):
-        return call.func.id
-    if isinstance(call.func, ast.Attribute):
-        return call.func.attr
-    return None
 
 
 def _assign_target_names(node: ast.AST) -> list[str]:
@@ -491,133 +648,23 @@ def extract_file_entities(
     source: str | None = None,
     tree: ast.Module | None = None,
 ) -> dict:
-    """Parses a python file using its absolute path, but labels the nodes
-
-    using the relative path format to match the existing graph ledger.
-    """
+    """Return graph node entities for a repo-relative Python file."""
     full_path = repo_root / rel_path
     if not full_path.exists():
         return {}
 
-    if tree is None:
-        with open(full_path, "r", encoding="utf-8") as f:
-            source = f.read()
-        try:
-            tree = ast.parse(source, filename=str(full_path))
-        except SyntaxError as e:
-            print(f"  [Parser Error] Syntax error while reading {rel_path}: {e}")
-            return {}
-    elif source is None:
-        try:
-            with open(full_path, "r", encoding="utf-8") as f:
-                source = f.read()
-        except OSError:
-            return {}
-        
-    entities = {}
-    cache: dict[str, str] = doc_cache if doc_cache is not None else {}
-    auto_enabled = _should_auto_docstrings() if enable_auto_docstrings is None else enable_auto_docstrings
-    
-    class RepoASTVisitor(ast.NodeVisitor):
-        def __init__(self):
-            self.current_class = None
-            self.current_function = None
-            
-        def visit_ClassDef(self, node):
-            node_id = f"{rel_path}::{node.name}"
-            docstring = ast.get_docstring(node) or ""
-            bases = [ast.unparse(b) for b in node.bases]
-            entities[node_id] = {
-                "type": "CLASS",
-                "name": node.name,
-                "file_path": rel_path,
-                "chunk_text": ast.get_source_segment(source, node),
-                "line_span": (node.lineno, node.end_lineno or node.lineno),
-                "docstring": docstring,
-                "bases": bases,
-                "embedding_text": build_embedding_text(
-                    "CLASS", node.name, docstring=docstring, bases=bases
-                ),
-            }
-            old_class = self.current_class
-            self.current_class = node.name
-            self.generic_visit(node)
-            self.current_class = old_class
-            
-        def visit_FunctionDef(self, node):
-            if self.current_class:
-                node_id = f"{rel_path}::{self.current_class}.{node.name}"
-            else:
-                node_id = f"{rel_path}::{node.name}"
-                
-            args = [arg.arg for arg in node.args.args]
-            signature = f"({', '.join(args)})"
-            native_docstring = ast.get_docstring(node) or ""
-            body_hash = _function_body_hash(node)
-            chunk_text = ast.get_source_segment(source, node) or ""
-
-            auto_docstring = ""
-            docstring_source = "native"
-            chosen_docstring = native_docstring
-            if not native_docstring and auto_enabled:
-                auto_docstring = _auto_docstring_for_function(
-                    function_name=node.name,
-                    chunk_text=chunk_text,
-                    doc_cache=cache,
-                    body_hash=body_hash,
-                    model=ollama_model,
-                    timeout_s=ollama_timeout_s,
-                )
-                if auto_docstring:
-                    chosen_docstring = auto_docstring
-                    docstring_source = "auto"
-                else:
-                    chosen_docstring = ""
-                    docstring_source = "none"
-
-            entities[node_id] = {
-                "type": "FUNCTION",
-                "name": node.name,
-                "file_path": rel_path,
-                "chunk_text": chunk_text,
-                "line_span": (node.lineno, node.end_lineno or node.lineno),
-                "signature": signature,
-                "docstring": chosen_docstring,
-                "auto_docstring": auto_docstring,
-                "docstring_source": docstring_source,
-                "body_hash": body_hash,
-                "belongs_to_class": self.current_class,
-                "embedding_text": build_embedding_text(
-                    "FUNCTION",
-                    node.name,
-                    docstring=chosen_docstring,
-                    belongs_to_class=self.current_class,
-                ),
-            }
-            old_function = self.current_function
-            self.current_function = node.name
-            self.generic_visit(node)
-            self.current_function = old_function
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Assign(self, node):
-            if self.current_class is not None or self.current_function is not None:
-                return
-            for target in node.targets:
-                if not isinstance(target, ast.Name):
-                    continue
-                node_id = f"{rel_path}::{target.id}"
-                entities[node_id] = {
-                    "type": "CONSTANT",
-                    "name": target.id,
-                    "file_path": rel_path,
-                    "chunk_text": ast.get_source_segment(source, node) or "",
-                    "line_span": (node.lineno, node.end_lineno or node.lineno),
-                    "signature": "",
-                    "embedding_text": build_embedding_text("CONSTANT", target.id),
-                }
-
-    visitor = RepoASTVisitor()
-    visitor.visit(tree)
-    return entities
+    result = parse_python_file(
+        full_path,
+        rel_path=rel_path,
+        source=source,
+        tree=tree,
+        build_entities=True,
+        doc_cache=doc_cache,
+        ollama_model=ollama_model,
+        ollama_timeout_s=ollama_timeout_s,
+        enable_auto_docstrings=enable_auto_docstrings,
+    )
+    if result.get("error"):
+        print(f"  [Parser Error] Syntax error while reading {rel_path}: {result['error']}", file=sys.stderr)
+        return {}
+    return result.get("entities", {})

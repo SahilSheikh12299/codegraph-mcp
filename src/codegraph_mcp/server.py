@@ -10,7 +10,7 @@ import networkx as nx
 from filelock import FileLock
 from mcp.server.fastmcp import FastMCP
 
-from codegraph_mcp.file_parsing import extract_file_entities, WorkspaceScanner, ASTParser, ImportTracker, read_python_ast
+from codegraph_mcp.file_parsing import extract_file_entities, WorkspaceScanner, ImportTracker, read_python_ast, parse_python_file
 from codegraph_mcp.graph_io import GraphSerializer
 from codegraph_mcp.embedding_pipeline import EmbeddingModelLifecycleManager, LocalEmbeddingPipeline
 from codegraph_mcp.ollama_client import unload_model
@@ -222,12 +222,19 @@ def _parse_file_call_assets(
                 "internal_imports": [],
             }
         source, tree = parsed
-    ast_data = ASTParser(file_path=full_path).parse(source=source, tree=tree)
+    parsed_file = parse_python_file(full_path, rel_path=rel_path, source=source, tree=tree)
+    if parsed_file.get("error"):
+        return {
+            "classes": [],
+            "functions": [],
+            "top_level_calls": [],
+            "internal_imports": [],
+        }
     import_data = tracker.get_dependencies(full_path, tree=tree)
     return {
-        "classes": ast_data.get("classes", []),
-        "functions": ast_data.get("functions", []),
-        "top_level_calls": ast_data.get("top_level_calls", []),
+        "classes": parsed_file.get("classes", []),
+        "functions": parsed_file.get("functions", []),
+        "top_level_calls": parsed_file.get("top_level_calls", []),
         "internal_imports": import_data.get("internal_paths", []),
     }
 

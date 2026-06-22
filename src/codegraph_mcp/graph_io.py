@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 import networkx as nx
 from networkx.readwrite import json_graph
-from codegraph_mcp.file_parsing import WorkspaceScanner, ImportTracker, ASTParser, extract_file_entities, read_python_ast
+from codegraph_mcp.file_parsing import WorkspaceScanner, ImportTracker, parse_python_file, read_python_ast
 from codegraph_mcp.build_graph import RepositoryGraphCompiler
 
 
@@ -50,7 +50,7 @@ class GraphSerializer:
             tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
 
             evaluation_report = {}
-            parsed_by_rel: dict[str, tuple[str, Any]] = {}
+            entities_by_file: dict[str, dict[str, Any]] = {}
 
             for file_path in python_files:
                 repo_relative_path = str(file_path.relative_to(repo_root))
@@ -60,40 +60,38 @@ class GraphSerializer:
                 if parsed is None:
                     continue
                 source, tree = parsed
-                parsed_by_rel[repo_relative_path] = parsed
 
-                # Parse structural tokens
-                ast_data = ASTParser(file_path=file_path).parse(source=source, tree=tree)
+                parsed_file = parse_python_file(
+                    file_path,
+                    rel_path=repo_relative_path,
+                    source=source,
+                    tree=tree,
+                    build_entities=True,
+                    enable_auto_docstrings=False,
+                )
+                if parsed_file.get("error"):
+                    continue
 
-                # Track import linkages seamlessly
                 import_data = tracker.get_dependencies(file_path, tree=tree)
-                
+
                 evaluation_report[repo_relative_path] = {
-                    "classes": ast_data.get("classes", []),
-                    "functions": ast_data.get("functions", []),
-                    "globals": ast_data.get("globals", []),
-                    "top_level_calls": ast_data.get("top_level_calls", []),
+                    "docstring": parsed_file.get("docstring", ""),
+                    "line_count": source.count("\n") + 1 if source else 0,
+                    "classes": parsed_file.get("classes", []),
+                    "functions": parsed_file.get("functions", []),
+                    "globals": parsed_file.get("globals", []),
+                    "top_level_calls": parsed_file.get("top_level_calls", []),
                     "internal_imports": import_data.get("internal_paths", []),
-                    "external_imports": import_data.get("external_modules", [])
+                    "external_imports": import_data.get("external_modules", []),
                 }
+                entities_by_file[repo_relative_path] = parsed_file.get("entities", {})
 
             compiler = RepositoryGraphCompiler(evaluation_report)
             code_graph_instance = compiler.compile()
             G = code_graph_instance.graph
 
-            for file_path in python_files:
-                repo_relative_path = str(file_path.relative_to(repo_root))
-                parsed = parsed_by_rel.get(repo_relative_path)
-                if parsed is None:
-                    continue
-                source, tree = parsed
-                for node_id, data in extract_file_entities(
-                    repo_relative_path,
-                    repo_root,
-                    enable_auto_docstrings=False,
-                    source=source,
-                    tree=tree,
-                ).items():
+            for _repo_relative_path, entities in entities_by_file.items():
+                for node_id, data in entities.items():
                     if G.has_node(node_id):
                         G.nodes[node_id]["chunk_text"] = data["chunk_text"]
                         G.nodes[node_id]["embedding_text"] = data["embedding_text"]
