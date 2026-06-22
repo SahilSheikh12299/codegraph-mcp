@@ -24,18 +24,6 @@ def _display_name(entry: dict[str, Any]) -> str:
     return entry.get("name") or short_name(entry.get("node_id", ""))
 
 
-def _role_label(name: str, role: str) -> str:
-    if role == "anchor":
-        return f"**{name}** (anchor)"
-    if role == "caller":
-        return f"{name} (caller)"
-    if role == "callee":
-        return f"{name} (callee)"
-    if role == "downstream":
-        return f"{name} (downstream)"
-    return name
-
-
 def _chain_pick(chain: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     caller = next((s for s in chain if s.get("role") == "caller"), None)
     anchor = next((s for s in chain if s.get("role") == "anchor"), None)

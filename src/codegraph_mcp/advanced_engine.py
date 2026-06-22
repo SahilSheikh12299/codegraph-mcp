@@ -10,29 +10,11 @@ SEMANTIC_POOL_SIZE = 50
 STAGE1_POOL_SIZE = 20
 STAGE1_SEMANTIC_WEIGHT = 0.7
 STAGE1_KEYWORD_WEIGHT = 0.3
-SOURCE_EXCERPT_MAX_LINES = 100
 NEIGHBOR_ID_LIMIT = 5
 BUCKET_SEMANTIC_TOP_K = 2
 GREP_FUZZY_TOP_K = 3
 GREP_EXACT_TOP_K = 1
 NEIGHBOR_RERANK_POOL = 20
-
-_STOPWORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "how", "what", "where", "when",
-    "does", "do", "did", "for", "and", "or", "to", "in", "on", "of", "with",
-    "after", "before", "from", "by", "it", "this", "that", "can", "will", "not",
-})
-
-
-def extract_keywords_from_queries(search_queries: List[str]) -> List[str]:
-    """Loose keyword tokens from all search queries (no exact-symbol mode)."""
-    # TODO: Add more advanced keyword extraction logic here. Use spacy for better keyword extraction.
-    keywords: set[str] = set()
-    for query in search_queries:
-        for token in re.findall(r"[a-zA-Z0-9_]+", query.lower()):
-            if len(token) >= 3 and token not in _STOPWORDS:
-                keywords.add(token)
-    return sorted(keywords)
 
 
 def compute_keyword_score(data: Dict[str, Any], keywords: List[str]) -> float:
@@ -68,17 +50,6 @@ def build_rerank_passage(data: Dict[str, Any]) -> str:
         return f"{meta}\n\n{skeleton}"
     return skeleton or meta
 
-
-_NON_PYTHON_PATH_HINTS = [
-    "tests/**",
-    "test/**",
-    "docs/**",
-    "doc/**",
-    "**/*.md",
-    "**/*.rst",
-    "HISTORY.*",
-    "CHANGELOG.*",
-]
 
 def build_grep_text(data: Dict[str, Any]) -> str:
     """Compact searchable text for literal grep-replica (no chunk_text)."""
@@ -225,6 +196,22 @@ def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def _max_cosine_sims_per_node(
+    query_vectors: np.ndarray,
+    node_matrix: np.ndarray,
+) -> np.ndarray:
+    """Max cosine similarity across query rows for each node row. Returns shape (N,)."""
+    if node_matrix.size == 0:
+        return np.array([], dtype=np.float64)
+    q_norms = np.linalg.norm(query_vectors, axis=1, keepdims=True)
+    n_norms = np.linalg.norm(node_matrix, axis=1, keepdims=True)
+    q_normalized = query_vectors / np.where(q_norms == 0, 1.0, q_norms)
+    n_normalized = node_matrix / np.where(n_norms == 0, 1.0, n_norms)
+    max_sim = (q_normalized @ n_normalized.T).max(axis=0)
+    max_sim[n_norms.ravel() == 0] = 0.0
+    return max_sim
 
 
 def _all_call_neighbors(G: nx.DiGraph, node_id: str) -> tuple[list[str], list[str]]:
@@ -537,23 +524,6 @@ class AdvancedRetrievalEngine:
         self.G = graph_instance
         self.embedder = embedder_instance
         self.reranker = reranker
-
-    def _calculate_cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
-        """Computes the standard cosine similarity between two normalized vectors."""
-        a = np.array(vec_a)
-        b = np.array(vec_b)
-        
-        # Absolute safety check taken from your older vector calculation mechanics
-        if a.shape[0] == 0 or b.shape[0] == 0:
-            return 0.0
-            
-        dot_product = np.dot(a, b)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(dot_product / (norm_a * norm_b))
     
     def run_hybrid_retrieval(
         self,
@@ -570,21 +540,27 @@ class AdvancedRetrievalEngine:
         if query_vectors.ndim == 1:
             query_vectors = query_vectors.reshape(1, -1)
 
-        scored_hits: list[tuple[str, Dict[str, Any], float]] = []
+        node_ids: list[str] = []
+        node_data_list: list[Dict[str, Any]] = []
+        node_rows: list[list[float]] = []
         for node_id, data in self.G.nodes(data=True):
             if data.get("type") not in ("CLASS", "FUNCTION"):
                 continue
-
             node_vector = data.get("embedding")
             if not node_vector or len(node_vector) == 0:
                 continue
+            node_ids.append(node_id)
+            node_data_list.append(data)
+            node_rows.append(node_vector)
 
-            max_sim = max(
-                self._calculate_cosine_similarity(qv.tolist(), node_vector)
-                for qv in query_vectors
-            )
-            if max_sim > 0.0:
-                scored_hits.append((node_id, data, max_sim))
+        scored_hits: list[tuple[str, Dict[str, Any], float]] = []
+        if node_rows:
+            node_matrix = np.asarray(node_rows, dtype=np.float64)
+            max_sims = _max_cosine_sims_per_node(query_vectors, node_matrix)
+            for node_id, data, max_sim in zip(node_ids, node_data_list, max_sims):
+                max_sim_f = float(max_sim)
+                if max_sim_f > 0.0:
+                    scored_hits.append((node_id, data, max_sim_f))
 
         scored_hits.sort(key=lambda x: x[2], reverse=True)
         semantic_pool = scored_hits[:SEMANTIC_POOL_SIZE]
@@ -706,7 +682,6 @@ class AdvancedRetrievalEngine:
             "rewritten_queries": queries,
             "grep_terms": grep_terms,
             "semantic_by_query": semantic_by_query,
-            # "semantic_bucket": {"nodes": semantic_nodes},
             "grep_buckets": grep_buckets,
         }
 

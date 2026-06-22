@@ -4,7 +4,7 @@ from typing import Any
 import networkx as nx
 from networkx.readwrite import json_graph
 from codegraph_mcp.file_parsing import WorkspaceScanner, ImportTracker, ASTParser, extract_file_entities, read_python_ast
-from codegraph_mcp.build_graph import RepositoryGraphCompiler, CodeChunker
+from codegraph_mcp.build_graph import RepositoryGraphCompiler
 
 
 class GraphSerializer:
@@ -24,8 +24,6 @@ class GraphSerializer:
         G.graph["workspace_path"] = abs_path_str
         
         # Resolve the destination file hash signature
-        #target_file_path = GraphSerializer.get_graph_path_for_workspace(abs_path_str)
-        # Transform graph entities and structural edges to primitive python dictionaries
         serialized_data = json_graph.node_link_data(G)
         
         with open(graph_path, "w", encoding="utf-8") as f:
@@ -81,13 +79,7 @@ class GraphSerializer:
 
             compiler = RepositoryGraphCompiler(evaluation_report)
             code_graph_instance = compiler.compile()
-            #G = code_graph_instance.graph
-            
-
-            chunker = CodeChunker(code_graph=code_graph_instance)
-            # This will update the graph with code chunks
-            _ = chunker.extract_and_bind_chunks() 
-            G = chunker.graph
+            G = code_graph_instance.graph
 
             for file_path in python_files:
                 repo_relative_path = str(file_path.relative_to(repo_root))
