@@ -584,7 +584,7 @@ class AdvancedRetrievalEngine:
                     pair_node_ids.append(node_id)
 
             ce_scores = self.reranker.predict(pairs, batch_size=16)
-            node_meta = {nid: (data, kw) for nid, data, _, kw, _ in stage1_pool}
+            node_data = {nid: data for nid, data, _, _, _ in stage1_pool}
             node_max_scores: dict[str, float] = {}
             for node_id, score in zip(pair_node_ids, ce_scores):
                 score_f = float(score)
@@ -592,14 +592,14 @@ class AdvancedRetrievalEngine:
                     node_max_scores[node_id] = score_f
 
             final_reranked = [
-                (nid, node_meta[nid][0], node_max_scores[nid], node_meta[nid][1])
+                (nid, node_data[nid], node_max_scores[nid])
                 for nid in node_max_scores
             ]
             final_reranked.sort(key=lambda x: x[2], reverse=True)
         else:
             final_reranked = [
-                (node_id, data, prelim, kw_score)
-                for node_id, data, prelim, kw_score, _ in stage1_pool
+                (node_id, data, prelim)
+                for node_id, data, prelim, _, _ in stage1_pool
             ]
 
         final_selections = final_reranked[:SEARCH_RESULT_LIMIT]
@@ -609,8 +609,6 @@ class AdvancedRetrievalEngine:
                 "node_id": hit[0],
                 "metadata": hit[1],
                 "hybrid_score": round(hit[2], 4),
-                "keyword_score": round(hit[3], 4),
-                "callers": hit[1].get("calls_in_degree", 0),
             }
             for hit in final_selections
         ]
@@ -623,17 +621,14 @@ class AdvancedRetrievalEngine:
         """Bucketed retrieval.
 
         Returns:
-        - semantic_by_query: top semantic candidates per individual query (preferred for term-scoped UX)
-        - semantic_bucket: legacy pooled semantic candidates across all queries (kept for compatibility)
+        - semantic_by_query: top semantic candidates per individual query
         - grep_buckets: per-grep-term candidates
         """
         grep_terms = [t.strip() for t in (grep_terms or []) if t and t.strip()]
         queries = [q.strip() for q in search_queries if q and q.strip()]
 
         semantic_by_query: list[dict[str, Any]] = []
-        semantic_nodes: list[dict[str, Any]] = []  # legacy pooled bucket
         if queries:
-            # Per-query semantic hits (top-K per query).
             for q in queries:
                 q_hits = self.run_hybrid_retrieval([q], keywords=[])
                 q_nodes: list[dict[str, Any]] = []
@@ -648,19 +643,12 @@ class AdvancedRetrievalEngine:
                     )
                 semantic_by_query.append({"query": q, "nodes": q_nodes})
 
-            # Legacy pooled semantic hits across the full query list.
-            query_hits = self.run_hybrid_retrieval(queries, keywords=[])
-            for hit in query_hits[:BUCKET_SEMANTIC_TOP_K]:
-                semantic_nodes.append(
-                    format_search_candidate(
-                        self.G,
-                        hit["node_id"],
-                        hit["metadata"],
-                        score=hit["hybrid_score"],
-                    )
-                )
-
-        affinity_paths = {n["file_path"] for n in semantic_nodes if n.get("file_path")}
+        affinity_paths: set[str] = set()
+        for bucket in semantic_by_query:
+            for node in bucket.get("nodes") or []:
+                file_path = node.get("file_path")
+                if file_path:
+                    affinity_paths.add(file_path)
 
         grep_buckets: list[dict[str, Any]] = []
         for term in grep_terms:
