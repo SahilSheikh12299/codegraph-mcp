@@ -215,11 +215,17 @@ def _parse_file_call_assets(repo_root: Path, rel_path: str, tracker: ImportTrack
     }
 
 
-def _rewire_all_calls(G: nx.DiGraph, repo_root: Path) -> None:
+def _rewire_all_calls(
+    G: nx.DiGraph,
+    repo_root: Path,
+    *,
+    python_files: list[Path] | None = None,
+) -> None:
     strip_calls_edges(G)
     registry = build_func_registry_from_graph(G)
     tracked = {d.get("file_path") for _, d in G.nodes(data=True) if d.get("file_path")}
-    python_files = WorkspaceScanner(repo_root).scan()
+    if python_files is None:
+        python_files = WorkspaceScanner(repo_root).scan()
     tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
     for rel_path in sorted(tracked):
         if (repo_root / rel_path).exists():
@@ -249,6 +255,8 @@ def sync_docstrings(
     repo_root: Path,
     G: nx.DiGraph,
     doc_cache: dict[str, str],
+    *,
+    python_files: list[Path] | None = None,
 ) -> tuple[bool, bool]:
     """Phase 1: Ollama docstrings only (no embedding model loaded)."""
     if "indexed_timestamps" not in G.graph:
@@ -259,7 +267,9 @@ def sync_docstrings(
     graph_dirty = False
     force_all = G.graph.get("intent_doc_schema") != INTENT_DOC_SCHEMA
 
-    current_files = {str(p.relative_to(repo_root)) for p in WorkspaceScanner(repo_root).scan()}
+    if python_files is None:
+        python_files = WorkspaceScanner(repo_root).scan()
+    current_files = {str(p.relative_to(repo_root)) for p in python_files}
     files_to_process: set[str] = set()
     if force_all:
         files_to_process = set(tracked_files) | current_files
@@ -313,6 +323,8 @@ def sync_embeddings_and_graph(
     repo_root: Path,
     G: nx.DiGraph,
     embedder: LocalEmbeddingPipeline,
+    *,
+    python_files: list[Path] | None = None,
 ) -> bool:
     """Phase 2: embeddings + grep + call graph (embedding model loaded; Ollama unloaded)."""
     if "indexed_timestamps" not in G.graph:
@@ -320,6 +332,9 @@ def sync_embeddings_and_graph(
 
     tracked_files = _tracked_files(G)
     dirty = False
+
+    if python_files is None:
+        python_files = WorkspaceScanner(repo_root).scan()
 
     if G.graph.get("chunk_schema") != CHUNK_SCHEMA or _needs_embedding_backfill(G):
         print("[Sync Engine] Backfilling chunks + embeddings...", file=sys.stderr)
@@ -342,7 +357,7 @@ def sync_embeddings_and_graph(
         dirty = True
 
     if G.graph.get("calls_schema") != CALLS_SCHEMA:
-        _rewire_all_calls(G, repo_root)
+        _rewire_all_calls(G, repo_root, python_files=python_files)
         G.graph["calls_schema"] = CALLS_SCHEMA
         dirty = True
     elif G.graph.get("centrality_schema") != 1:
@@ -362,7 +377,7 @@ def sync_embeddings_and_graph(
             dirty = True
             calls_graph_changed = True
 
-    current_files = {str(p.relative_to(repo_root)) for p in WorkspaceScanner(repo_root).scan()}
+    current_files = {str(p.relative_to(repo_root)) for p in python_files}
     new_files = sorted(current_files - tracked_files)
     for idx, rel_path in enumerate(new_files, 1):
         _print_progress("[Sync Engine] Indexing new files", idx, len(new_files))
@@ -452,7 +467,6 @@ def sync_embeddings_and_graph(
             dirty = True
 
             if import_tracker is None:
-                python_files = WorkspaceScanner(repo_root).scan()
                 import_tracker = ImportTracker(repo_root=repo_root, all_python_files=python_files)
             _rewire_file_calls(G, repo_root, rel_path, import_tracker)
 
@@ -566,9 +580,12 @@ def search_codebase_intent(
         with FileLock(lock_path):
             G = GraphSerializer.load_from_json(workspace_root, graph_path)
             doc_cache = _load_doc_cache(doc_cache_path)
+            python_files = WorkspaceScanner(workspace_root).scan()
 
             # Phase 1: Ollama docstrings (no embedding model in RAM).
-            doc_dirty, cache_dirty = sync_docstrings(workspace_root, G, doc_cache)
+            doc_dirty, cache_dirty = sync_docstrings(
+                workspace_root, G, doc_cache, python_files=python_files
+            )
             if cache_dirty:
                 _save_doc_cache(doc_cache_path, doc_cache)
             print("[Docstrings] Unloading Ollama model from memory...", file=sys.stderr)
@@ -577,7 +594,9 @@ def search_codebase_intent(
             # Phase 2: load embedding model, embed, then search.
             embedder = model_manager.acquire()
             reranker = model_manager.acquire_reranker()
-            emb_dirty = sync_embeddings_and_graph(workspace_root, G, embedder)
+            emb_dirty = sync_embeddings_and_graph(
+                workspace_root, G, embedder, python_files=python_files
+            )
             if doc_dirty or emb_dirty:
                 GraphSerializer.save_to_json(G, workspace_root, graph_path)
 
