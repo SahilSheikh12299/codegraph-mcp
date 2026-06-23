@@ -2,13 +2,12 @@
 
 | File | Purpose |
 |------|---------|
-| `demo.mp4` | Product demo (linked from README) |
-| `mascot.png` | Repo mascot / clickable demo thumbnail |
+| `demo.mp4` | Product demo video |
+| `demo-poster.jpg` | README thumbnail (frame from demo; click opens video) |
+| `mascot.png` | Repo mascot |
 
-## README video on GitHub
+Regenerate poster after re-recording demo (macOS):
 
-GitHub **strips `<video>` tags** from README — including release-asset URLs. Inline players do not render.
-
-**What works:** a clickable image that opens `blob/main/assets/demo.mp4` in GitHub's built-in player.
-
-For a true inline player (optional): edit README on github.com, drag `demo.mp4` into the editor, and use the `user-attachments` URL GitHub inserts. That path is web-UI only.
+```bash
+qlmanage -t -s 1200 -o . demo.mp4 && mv -f demo.mp4.png demo-poster.jpg
+```

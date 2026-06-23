@@ -1,10 +1,8 @@
 # codegraph-mcp
 
 <p align="center">
-  <img src="assets/mascot.png" alt="codegraph-mcp mascot" width="160" />
+  <img src="assets/mascot.png" alt="codegraph-mcp" width="120" />
 </p>
-
-<br />
 
 Intent search over your Python repo's call graph, inside Cursor. One MCP tool returns cite spans and caller→anchor→callee chains so the agent searches once, reads surgically, and burns fewer tokens than grep-then-read loops.
 
@@ -12,17 +10,9 @@ Intent search over your Python repo's call graph, inside Cursor. One MCP tool re
 
 <p align="center">
   <a href="https://github.com/SahilSheikh12299/codegraph-mcp/blob/main/assets/demo.mp4">
-    <img src="assets/mascot.png" alt="▶ Click to watch the codegraph-mcp demo" width="360" />
+    <img src="assets/demo-poster.jpg" alt="Watch demo — click to play" width="720" />
   </a>
 </p>
-
-<p align="center">
-  <strong><a href="https://github.com/SahilSheikh12299/codegraph-mcp/blob/main/assets/demo.mp4">▶ Watch demo</a></strong>
-  <br />
-  <sub>Click the image or link — opens GitHub's video player</sub>
-</p>
-
-<br />
 
 ## Requirements
 
