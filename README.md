@@ -11,17 +11,15 @@ Intent search over your Python repo's call graph, inside Cursor. One MCP tool re
 ## Demo
 
 <p align="center">
-  <video
-    src="https://github.com/SahilSheikh12299/codegraph-mcp/releases/download/v0.1.0/demo.mp4"
-    poster="assets/mascot.png"
-    controls
-    playsinline
-    width="720">
-  </video>
+  <a href="https://github.com/SahilSheikh12299/codegraph-mcp/blob/main/assets/demo.mp4">
+    <img src="assets/mascot.png" alt="▶ Click to watch the codegraph-mcp demo" width="360" />
+  </a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/SahilSheikh12299/codegraph-mcp/raw/main/assets/demo.mp4"><strong>▶ Watch or download demo</strong></a>
+  <strong><a href="https://github.com/SahilSheikh12299/codegraph-mcp/blob/main/assets/demo.mp4">▶ Watch demo</a></strong>
+  <br />
+  <sub>Click the image or link — opens GitHub's video player</sub>
 </p>
 
 <br />
