@@ -4,15 +4,27 @@
   <img src="assets/mascot.png" alt="codegraph-mcp mascot" width="160" />
 </p>
 
+<br />
+
 Intent search over your Python repo's call graph, inside Cursor. One MCP tool returns cite spans and caller→anchor→callee chains so the agent searches once, reads surgically, and burns fewer tokens than grep-then-read loops.
 
 ## Demo
 
-Add your recording as `assets/demo.mp4` (see [`assets/README.md`](assets/README.md)). It embeds here on GitHub:
+<p align="center">
+  <video
+    src="https://github.com/SahilSheikh12299/codegraph-mcp/releases/download/v0.1.0/demo.mp4"
+    poster="assets/mascot.png"
+    controls
+    playsinline
+    width="720">
+  </video>
+</p>
 
-<video src="assets/demo.mp4" controls width="100%">
-  <a href="assets/demo.mp4">Download demo.mp4</a>
-</video>
+<p align="center">
+  <a href="https://github.com/SahilSheikh12299/codegraph-mcp/raw/main/assets/demo.mp4"><strong>▶ Watch or download demo</strong></a>
+</p>
+
+<br />
 
 ## Requirements
 
