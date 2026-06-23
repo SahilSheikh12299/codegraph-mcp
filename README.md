@@ -1,6 +1,18 @@
 # codegraph-mcp
 
+<p align="center">
+  <img src="assets/mascot.png" alt="codegraph-mcp mascot" width="160" />
+</p>
+
 Intent search over your Python repo's call graph, inside Cursor. One MCP tool returns cite spans and caller→anchor→callee chains so the agent searches once, reads surgically, and burns fewer tokens than grep-then-read loops.
+
+## Demo
+
+Add your recording as `assets/demo.mp4` (see [`assets/README.md`](assets/README.md)). It embeds here on GitHub:
+
+<video src="assets/demo.mp4" controls width="100%">
+  <a href="assets/demo.mp4">Download demo.mp4</a>
+</video>
 
 ## Requirements
 
@@ -72,6 +84,44 @@ Returns markdown with up to **2 matches per grep term and per search query**: an
 2. Prefetches HuggingFace embedding + reranker models (warns if offline)
 3. Merges `codegraph-mcp` into `~/.cursor/mcp.json`
 4. Installs agent skill at `~/.cursor/skills/codegraph-mcp/SKILL.md`
+
+## Performance expectations
+
+| Phase | What happens | Typical feel |
+|-------|----------------|--------------|
+| **First `setup`** | Ollama check + HF model download (~3–5 GB) | One-time; minutes if models aren't cached |
+| **First search on a repo** | Incremental index: Ollama docstrings → call graph → embeddings | Minutes on medium/large repos; seconds on tiny ones |
+| **Later searches (warm cache)** | Mtime check only; embed/rerank changed files | Usually seconds |
+| **Every search call** | Reloads embedding + reranker models, runs sync under a file lock, then retrieves | Adds model load time between idle searches (see below) |
+
+**Why searches aren't instant:** Each `search_codebase_intent` call syncs the graph for that workspace, then searches. That keeps results fresh but means the tool is "sync then search," not a pure in-memory lookup.
+
+**Model memory:** Embedding and reranker models unload after each tool call to keep RAM down. The next search pays load cost again (~few seconds on CPU, faster with GPU). Concurrent overlapping calls share one loaded instance.
+
+**Rough repo sizing (first index, CPU, Ollama docstrings on):**
+
+| Repo size | Python files | Ballpark first index |
+|-----------|--------------|----------------------|
+| Tiny | &lt; 20 | ~30s–2 min |
+| Small | 20–100 | ~2–10 min |
+| Medium | 100–500 | ~10–30+ min |
+| Large | 500+ | 30+ min; consider `CURSOR_GRAPHRAG_AUTO_DOCSTRINGS=0` for a faster cold start |
+
+Disable auto-docstrings during indexing if you only want speed over semantic richness:
+
+```bash
+export CURSOR_GRAPHRAG_AUTO_DOCSTRINGS=0
+```
+
+## Known limitations (v0.1)
+
+- **Python only** — `.py` source files; no JS, Go, notebooks as first-class targets.
+- **Static call graph** — `CALLS` edges come from AST name resolution + import tracking. Dynamic dispatch (`getattr`, `eval`, heavy metaprogramming) may be missing or incomplete.
+- **Cursor + MCP** — Tested around Cursor's MCP workflow and agent skill; other MCP hosts may work but aren't the primary target.
+- **Agent discipline** — The skill guides "one search, surgical reads," but the host model can still grep or over-read if it ignores the skill.
+- **Top-2 per term** — Returns at most two matches per grep term and per intent query by design (token budget). Obscure symbols may need a refined query or `grep_terms`.
+- **Local stack required** — Ollama + HuggingFace models; not a hosted/API-only product.
+- **Single global MCP process** — One Python env serves all workspaces; model weights install once in that venv.
 
 ## Documentation
 
