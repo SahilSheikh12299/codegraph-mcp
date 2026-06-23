@@ -9,12 +9,12 @@ flowchart LR
     subgraph index [Indexing per workspace]
         scan[WorkspaceScanner]
         ast[ASTParser]
-        graph[NetworkX graph]
+        callgraph[NetworkX graph]
         ollama[Ollama qwen2.5:1.5b]
         embed[BGE embeddings]
-        scan --> ast --> graph
-        graph --> ollama
-        graph --> embed
+        scan --> ast --> callgraph
+        callgraph --> ollama
+        callgraph --> embed
     end
     subgraph search [Search per query]
         intent[search_codebase_intent]
